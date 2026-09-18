@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "djai"
+version = "0.1.0"
+description = "AI-mixed DJ: real-time two-deck audio engine steered by a natural-language chat interface, with local inference."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    # BS.1770 integrated loudness for per-track normalisation (Phase 1).
+    "pyloudnorm>=0.1.1",
+    # Key lock stretches with the Rubber Band command-line tool, vendored under
+    # djai/bin/rubberband (GPL-2.0-or-later). It is run directly rather than
+    # through pyrubberband -- see djai.deck.time_stretch -- so neither is a
+    # Python dependency; a `rubberband` on PATH is used if the copy is absent.
+    "httpx>=0.27",
+    # The web UI (`djai play --ui`). Already imported by djai.ui_server; these
+    # were missing from this list, so a fresh install could start the engine and
+    # then fail on --ui.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+# Beat This! (MIT, code and weights) for offline beat, downbeat and grid
+# confidence analysis -- see djai/beat_tracker.py. Only `analyze` imports it.
+# For the GPU, install PyTorch from its CUDA index first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+beats = ["beat-this>=1.1", "torch>=2.0"]
+
+[tool.setuptools.packages.find]
+include = ["djai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,557 @@
+/* djai controller theme.
+ *
+ * Read at a glance in a dark room: near-black ground, two fixed deck accents,
+ * oversized hit targets, and monospaced numerics so values do not reflow as
+ * they tick. Nothing animates except the platter, the meters and the waveform.
+ */
+
+:root {
+  --bg: #07080a;
+  --panel: #101317;
+  --panel2: #171b21;
+  --line: #262c35;
+  --ink: #e8edf3;
+  --dim: #7b8794;
+  --a: #4fc3f7;          /* deck A accent */
+  --b: #ffb74d;          /* deck B accent */
+  --ok: #4caf50;
+  --warn: #ffb300;
+  --bad: #e53935;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --sans: "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+/* Any rule that sets `display` outranks the user agent's [hidden] rule, so a
+ * hidden element would otherwise stay on screen. A banner that says the
+ * automation is held when it is not is worse than no banner at all. */
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.num.big { font-size: 30px; font-weight: 700; letter-spacing: -0.5px; }
+.lbl {
+  font-size: 11px; letter-spacing: 1.4px; color: var(--dim);
+  text-transform: uppercase;
+}
+
+/* ---------------- held banner ---------------- */
+
+.banner {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 16px;
+  background: #3a2c05;
+  border-bottom: 2px solid var(--warn);
+  color: var(--warn);
+  font-weight: 700; letter-spacing: 1px;
+  flex: 0 0 auto;
+}
+
+/* ---------------- board ---------------- */
+
+#board {
+  flex: 1 1 auto;
+  display: grid;
+  /* minmax(0, ...) caps each track's automatic minimum. A bare 1fr resolves
+   * its minimum to min-content, and a canvas whose height attribute is written
+   * back from its measured height then grows without bound. */
+  grid-template-columns: minmax(0, 1fr) 300px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+  min-height: 0;
+}
+
+/* ---------------- decks ---------------- */
+
+.deck {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  /* Same rule as the mixer: a column that can be shorter than its content
+   * must clip, or the content paints over whatever is underneath it. */
+  min-height: 0;
+  overflow: hidden;
+}
+#deck-a { border-top: 3px solid var(--a); }
+#deck-b { border-top: 3px solid var(--b); }
+
+.deck .droplight {
+  position: absolute; inset: 0;
+  border-radius: 8px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.08s linear;
+}
+#deck-a.dragover .droplight { opacity: 1; box-shadow: inset 0 0 0 4px var(--a); }
+#deck-b.dragover .droplight { opacity: 1; box-shadow: inset 0 0 0 4px var(--b); }
+
+.deck-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.deck-head .title {
+  font-size: 17px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.badge {
+  font-size: 11px; font-weight: 700; letter-spacing: 1px;
+  padding: 3px 8px; border-radius: 4px;
+  background: #23282f; color: var(--dim);
+}
+.badge.live { background: var(--ok); color: #04170a; }
+.badge.cued { background: #2b3340; color: var(--ink); }
+
+/* The canvas is taken out of flow inside a fixed-height wrapper, so its own
+ * height attribute can never feed back into the layout that sizes it. */
+.wave-wrap {
+  position: relative;
+  /* Prefers 150px, gives some back on a short screen rather than pushing the
+   * transport row out of the panel. */
+  flex: 0 1 150px;
+  min-height: 74px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.wave {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.deck-body { display: flex; gap: 14px; align-items: center; min-height: 0; }
+/* Sized in CSS, not by the canvas attribute, so it can give ground on a short
+ * screen. The renderer matches the backing store to this. */
+.platter {
+  flex: 0 1 auto;
+  width: clamp(96px, 15vh, 200px);
+  height: clamp(96px, 15vh, 200px);
+}
+.readout { flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
+.readout .row {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px;
+}
+.warnable.hot { color: var(--bad); }
+
+.pending {
+  padding: 7px 10px; border-radius: 4px;
+  background: #3a2c05; color: var(--warn);
+  font-size: 13px; font-weight: 600;
+}
+
+.transport { display: flex; gap: 10px; align-items: stretch; }
+
+/* ---------------- buttons ---------------- */
+
+.btn {
+  font-family: var(--sans);
+  font-weight: 700; letter-spacing: 1px;
+  color: var(--ink);
+  background: #222831;
+  border: 1px solid #39424f;
+  border-radius: 6px;
+  cursor: pointer;
+  min-height: 44px;
+  padding: 0 16px;
+  font-size: 15px;
+}
+.btn:hover { background: #2b323d; }
+.btn:active, .btn.armed { transform: translateY(1px); filter: brightness(1.5); }
+.btn.small { min-height: 34px; font-size: 12px; padding: 0 10px; }
+
+.btn.play { flex: 1 1 auto; font-size: 20px; min-height: 56px; }
+.btn.play.playing { background: var(--ok); border-color: #7fdc86; color: #04170a; }
+.btn.play.paused  { background: #4a1f22; border-color: var(--bad); color: #ffd7d7; }
+.btn.cue { flex: 0 0 110px; min-height: 56px; }
+
+.sync {
+  flex: 0 0 62px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid #39424f; border-radius: 6px;
+  font-size: 11px; font-weight: 700; letter-spacing: 1px;
+  color: var(--dim);
+}
+.sync.on { color: var(--ok); border-color: var(--ok); }
+
+.btn.keylock { flex: 0 0 56px; min-height: 56px; font-size: 12px; color: var(--dim); }
+.btn.keylock.on { color: var(--ok); border-color: var(--ok); }
+
+/* Waveform zoom: - label + under each deck's waveform. */
+.wzoom { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.wzoom .num { min-width: 52px; text-align: center; font-size: 11px; }
+
+/* Performance panel: loops, rolls, jumps, pitch. Small, dense, and wrapping
+ * rather than overflowing a narrow deck column. */
+.perf { display: flex; flex-direction: column; gap: 4px; }
+.pfrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.pfrow .lbl { flex: 0 0 44px; font-size: 10px; letter-spacing: 1px; color: var(--dim); }
+.btn.pf { min-height: 28px; padding: 0 7px; font-size: 11px; flex: 0 0 auto; }
+.btn.pf.on, #btn-quantize.on { color: var(--ok); border-color: var(--ok); }
+.pfrow input.pitch { flex: 1 1 120px; min-width: 0; }
+.pfrow .num { flex: 0 0 54px; font-size: 12px; text-align: right; }
+
+.filt {
+  width: 100%;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+}
+.filt span { font-size: 10px; letter-spacing: 1px; color: var(--dim); }
+.filt b { font-weight: 700; color: inherit; }
+/* A tick at the centre marks the detent. */
+.filt input[type="range"] {
+  width: 100%;
+  background:
+    linear-gradient(var(--dim), var(--dim)) center center / 2px 12px no-repeat,
+    linear-gradient(var(--dim), var(--dim)) center center / 100% 2px no-repeat;
+}
+
+/* Equal shares, not content-sized. With `flex: 1 1 auto` the basis is the
+ * label, so "KILL BASS" took the room and STOP was squeezed to seven pixels
+ * in a 300px column -- a panic button too narrow to hit. */
+.btn.panic {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 52px;
+  padding: 0 4px;
+  font-size: clamp(11px, 1.05vw, 16px);
+}
+.btn.cut  { background: #7f1d1d; border-color: #b33; }
+.btn.kill { background: #7a3c10; border-color: #c8781f; }
+.btn.stop { background: #4a2170; border-color: #8a5cc0; }
+.btn.on { background: var(--warn); border-color: #ffd54f; color: #1a1400; }
+
+/* ---------------- mixer ---------------- */
+
+/* The mixer column is a grid with ONE flexible row -- the channel strips.
+ * Everything else is auto-sized and always gets the height it asks for.
+ *
+ * It used to be a flex column whose children carried fixed pixel heights.
+ * Below about 800px of column the strips could not fit, and because a flex
+ * item does not clip its overflow, the sliders spilled out of their box and
+ * the buttons below painted on top of them. That is what "the knobs are
+ * behind the FREEZE row" was. z-index would only have changed which half of
+ * the collision you could see. */
+#mixer {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  /* The implicit column defaults to `auto`, whose automatic minimum is
+   * min-content -- so a wide row pushes the track past the container instead
+   * of being made to fit. minmax(0, 1fr) is what caps that. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows:
+    auto            /* master readouts */
+    auto            /* up next */
+    auto            /* transition */
+    minmax(0, 1fr)  /* channel strips: the only row that flexes */
+    auto            /* crossfader */
+    auto            /* overrides */
+    auto;           /* panic row */
+  gap: 8px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#masterbar { display: flex; flex-direction: column; gap: 3px; }
+#masterbar .row {
+  display: flex; align-items: baseline; justify-content: space-between;
+}
+.dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-right: 6px; background: var(--bad);
+}
+.dot.ok { background: var(--ok); }
+.num.ok { color: var(--ok); } .num.warn { color: var(--warn); }
+.num.bad { color: var(--bad); }
+
+/* Hot cues: stored markers inside the track. Nothing to do with the cue
+ * OUTPUT, which is the headphone monitor and lives in the status strip. */
+.hotcues { display: flex; gap: 4px; }
+.gridctl { display: flex; gap: 4px; }
+.btn.grid { flex: 1 1 0; padding: 0 4px; }
+.hc {
+  flex: 1 1 0;
+  min-height: 38px;
+  border-radius: 5px;
+  border: 1px solid #39424f;
+  background: #1b2029;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 2px 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.hc.set { color: var(--ink); background: #2a3340; }
+#deck-a .hc.set { border-color: var(--a); }
+#deck-b .hc.set { border-color: var(--b); }
+.hc:disabled { opacity: 0.5; cursor: not-allowed; }
+.hc .n { display: block; font-size: 13px; }
+.hc .l { display: block; font-size: 9px; letter-spacing: 0.5px; }
+
+#transbox {
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.tstyle { font-family: var(--mono); font-size: 15px; font-weight: 700; }
+.trule {
+  font-size: 11px; color: var(--dim); line-height: 1.3;
+  max-height: 3.9em; overflow: hidden;
+}
+.tdiv {
+  font-family: var(--mono); font-size: 11px; color: var(--a);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#style-pick {
+  background: #0a0d11; color: var(--ink);
+  border: 1px solid var(--line); border-radius: 5px;
+  padding: 7px; font-size: 13px; font-family: var(--sans);
+  min-height: 36px;
+}
+
+#upnext {
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 6px 0;
+}
+.qrow {
+  font-size: 12px; font-family: var(--mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding: 1px 0;
+}
+.qrow.dim { color: var(--dim); }
+
+/* Inside the strips nothing carries a fixed height: the EQ block and the
+ * fader block share whatever the row was given, down to a floor that keeps
+ * them usable. */
+/* `min-width: 0` on every level of this stack, because a flex or grid item
+ * defaults to `min-width: auto` and will not shrink below its content. Without
+ * it the two strips measured 400px inside a 300px column and the clip cut deck
+ * B's EQ off -- the same overflow-becomes-overlap failure, sideways. */
+#strips {
+  display: flex; gap: 10px;
+  min-height: 0; min-width: 0; overflow: hidden;
+}
+.strip {
+  flex: 1 1 0; display: flex; flex-direction: column; gap: 6px;
+  align-items: center; min-height: 0; min-width: 0;
+}
+.striphead {
+  width: 100%; text-align: center; font-weight: 700; letter-spacing: 2px;
+  padding: 4px 0; border-radius: 4px; background: #202631;
+}
+.strip[data-deck="a"] .striphead { color: var(--a); }
+.strip[data-deck="b"] .striphead { color: var(--b); }
+
+.eqs {
+  flex: 3 1 0;
+  display: flex; gap: 6px; justify-content: center;
+  min-height: 0; min-width: 0; width: 100%;
+}
+.eq {
+  /* A definite width rather than a share of the row: a vertical range input
+   * reports a wide intrinsic minimum in Chrome, and an `auto` basis inherits
+   * it. Three of these plus gaps is 114px, which fits the column twice over. */
+  flex: 0 1 34px;
+  width: 34px;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  min-height: 0; min-width: 0;
+}
+.eq span {
+  flex: 0 0 auto;
+  font-size: 10px; letter-spacing: 1px; color: var(--dim);
+}
+
+.faderbox {
+  flex: 2 1 0;
+  display: flex; gap: 8px; align-items: stretch; justify-content: center;
+  min-height: 0;
+}
+/* `min-width: 0` matters more than it looks. A flex item defaults to
+ * `min-width: auto`, and for a canvas that resolves to its intrinsic size --
+ * the backing store. Now that fitCanvas() sizes the backing store from the
+ * painted box times the device pixel ratio, an auto minimum would let the
+ * backing store push the layout wider, which fitCanvas would then match, and
+ * the meter would grow every frame. Measured: 14px to 43px at dpr 1 and 49px
+ * at dpr 2 before this was pinned. */
+.meter {
+  flex: 0 0 14px;
+  width: 14px;
+  min-width: 0;
+  height: auto;
+  background: #0a0d11; border: 1px solid var(--line); border-radius: 2px;
+}
+
+/* Vertical sliders via `writing-mode`, deliberately NOT the legacy
+ * `appearance: slider-vertical`: that keyword restores the native control and
+ * with it the small round thumb, which throws away the oversized cap below. */
+input[type="range"][orient="vertical"] {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 100%;
+  max-width: 34px;
+  min-width: 0;
+  /* Height comes from the flex row, with a floor that keeps the throw long
+   * enough to be worth grabbing. No fixed height means no overflow. */
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 56px;
+}
+.faderbox input[type="range"] { max-width: 40px; min-height: 70px; }
+
+input[type="range"] {
+  appearance: none; -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+  margin: 0;
+}
+/* Travel: a sunken slot, so the throw is visible from across a room. */
+input[type="range"]::-webkit-slider-runnable-track {
+  background: #0a0d11;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  width: 10px;
+}
+input[type="range"]::-moz-range-track {
+  background: #0a0d11; border: 1px solid var(--line);
+  border-radius: 3px; width: 10px;
+}
+/* Cap: deliberately oversized -- a mouse in the dark is imprecise. */
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 34px; height: 20px;
+  background: linear-gradient(#e9eef4, #9aa6b4);
+  border: 1px solid #05070a; border-radius: 4px;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 34px; height: 20px;
+  background: linear-gradient(#e9eef4, #9aa6b4);
+  border: 1px solid #05070a; border-radius: 4px;
+}
+/* Centre detent for the EQs: the visual notch at unity gain. */
+.eq input[type="range"] {
+  background:
+    linear-gradient(var(--dim), var(--dim)) center center / 22px 2px no-repeat;
+}
+
+#xfbox { display: flex; flex-direction: column; gap: 3px; }
+.xflabels {
+  display: flex; justify-content: space-between;
+  font-size: 11px; letter-spacing: 1px; color: var(--dim);
+}
+#xfader { width: 100%; height: 34px; }
+
+/* The transition preview. Dense and read-only: it reports what already
+ * happened in the pre-roll, so nothing here is a control. */
+#previewbox { font-size: 11px; min-width: 0; }
+#prev-body { padding: 6px 10px; overflow-y: auto; min-height: 0; }
+#bottom.collapsed #prev-body { display: none; }
+.pstate { letter-spacing: 1px; text-transform: uppercase; color: var(--dim); }
+#prev-time {
+  margin-left: auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* The four states worth a colour: working, changed something, gave up, and
+ * fell back. The rest stay dim -- a committed preview is the quiet case. */
+.pstate.running { color: var(--ink); }
+.pstate.revised, .pstate.reverted { color: var(--ok); }
+.pstate.budget { color: var(--warn); }
+.pstate.failed, .pstate.cut { color: var(--bad); }
+#prev-time { font-size: 10px; color: var(--dim); }
+.pmeas { margin-top: 4px; display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
+.mrow { display: flex; justify-content: space-between; gap: 4px; min-width: 0; }
+.ml { color: var(--dim); }
+.mv { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mv.moved { color: var(--ok); }
+.pdiff { margin-top: 4px; }
+.drow { color: var(--ok); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drow.dim { color: var(--dim); }
+
+#overrides { display: flex; gap: 6px; }
+#overrides .btn { flex: 1 1 0; padding: 0 4px; }
+#panics { display: flex; gap: 6px; }
+
+/* ---------------- bottom: library + chat ---------------- */
+
+#bottom {
+  flex: 0 1 232px;
+  min-height: 128px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px 360px;
+  gap: 10px;
+  padding: 0 10px 10px;
+  min-height: 0;
+}
+#bottom.collapsed { flex-basis: 58px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: flex; flex-direction: column; min-height: 0;
+}
+.panelhead {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.panelhead .count { margin-left: auto; font-size: 12px; color: var(--dim); }
+#lib-filter, #input {
+  background: #0a0d11; border: 1px solid var(--line); border-radius: 5px;
+  color: var(--ink); padding: 8px 10px; font-size: 14px; font-family: var(--sans);
+}
+#lib-filter { width: 190px; }
+.btn.sort.on { background: #2f3a48; border-color: #5c6b7d; }
+
+#lib-rows { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+#bottom.collapsed #lib-rows, #bottom.collapsed #log,
+#bottom.collapsed #entry { display: none; }
+
+.trk {
+  display: grid;
+  grid-template-columns: 1fr 74px 62px 66px 26px;
+  gap: 8px; align-items: center;
+  padding: 9px 10px;
+  border-bottom: 1px solid #1b2027;
+  cursor: grab;
+  font-size: 14px;
+}
+.trk:hover { background: #1a1f26; }
+.trk:active { cursor: grabbing; }
+.trk .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trk .n { font-family: var(--mono); color: var(--dim); text-align: right; }
+.trk .w { text-align: center; color: var(--warn); }
+.trk .rv {
+  display: inline-block; margin-right: 6px; padding: 0 4px; border-radius: 3px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  background: var(--warn); color: #1a1400;
+}
+
+#log { flex: 1 1 auto; overflow-y: auto; padding: 8px 10px; min-height: 0; }
+.msg { margin-bottom: 6px; font-size: 13px; line-height: 1.35; }
+.msg.you { color: var(--a); }
+.msg.sys { color: var(--dim); }
+.msg.err { color: var(--bad); }
+#entry { display: flex; gap: 6px; padding: 8px; flex: 0 0 auto; }
+#entry #input { flex: 1 1 auto; }

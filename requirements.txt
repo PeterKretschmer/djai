@@ -1,0 +1,28 @@
+# Core runtime dependencies, pinned to the versions this project was developed
+# and tested against (Python 3.12.10). See pyproject.toml for the looser ranges
+# that `pip install -e .` will accept.
+
+numpy==2.5.3
+scipy==1.18.1
+sounddevice==0.5.5
+soundfile==0.14.0
+librosa==1.0.0
+pyloudnorm==0.2.0
+httpx==0.28.1
+
+# Web UI (`python -m djai play --ui`)
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+
+# --- Optional -----------------------------------------------------------------
+# Tests:
+#   pytest==9.1.1
+#
+# Beat This! beat/downbeat grids (`djai analyze`) and HDemucs stem separation.
+# Heavy (several GB) and only needed for those two features. Install PyTorch from
+# its CUDA index first for GPU support, e.g.
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+#
+#   torch==2.14.0
+#   torchaudio==2.11.0
+#   beat-this==1.1.0

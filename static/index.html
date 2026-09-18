@@ -1,0 +1,252 @@
+<!-- djai controller UI. Vanilla JS + Canvas, no build step, no framework. -->
+<meta charset="utf-8" />
+<title>djai</title>
+<link rel="stylesheet" href="/static/style.css" />
+
+<div id="held" class="banner" hidden>
+  <span id="held-text">AUTOMATION HELD - you have manual control</span>
+  <button id="btn-resume-auto" class="btn small">RESUME AUTOMATION</button>
+</div>
+
+<main id="board">
+
+  <!-- ============================ DECK A ============================ -->
+  <section class="deck" id="deck-a" data-deck="a">
+    <div class="deck-head">
+      <span class="badge" id="badge-a">-</span>
+      <span class="title" id="title-a">no track loaded</span>
+    </div>
+
+    <div class="wave-wrap"><canvas class="wave" id="wave-a"
+      title="Drag the triangle at bar 1 to move the grid"></canvas></div>
+    <div class="wzoom" title="Zoom: whole track down to one bar (or scroll on the waveform)">
+      <button class="btn pf" id="wz-out-a">&minus;</button>
+      <span class="num" id="wz-lbl-a">full</span>
+      <button class="btn pf" id="wz-in-a">+</button>
+    </div>
+    <div class="gridctl" id="gridctl-a"></div>
+
+    <div class="deck-body">
+      <canvas class="platter" id="platter-a" width="200" height="200"></canvas>
+      <div class="readout">
+        <div class="row"><span class="lbl">BPM</span
+          ><span class="num big" id="bpm-a">---.-</span></div>
+        <div class="row"><span class="lbl">STRETCH</span
+          ><span class="num" id="stretch-a">--</span></div>
+        <div class="row"><span class="lbl">KEY</span
+          ><span class="num" id="key-a">--</span></div>
+        <div class="row"><span class="lbl">ELAPSED</span
+          ><span class="num" id="elapsed-a">-:--</span></div>
+        <div class="row"><span class="lbl">REMAIN</span
+          ><span class="num warnable" id="remain-a">-:--</span></div>
+      </div>
+    </div>
+
+    <div class="pending" id="pending-a" hidden></div>
+
+    <div class="hotcues" id="hotcues-a"></div>
+    <!-- Loops, rolls, beat jump, pitch fader and sync. Built by app.js. -->
+    <div class="perf" id="perf-a"></div>
+
+    <div class="transport">
+      <button class="btn play" id="play-a">PLAY</button>
+      <button class="btn cue" id="cuept-a">CUE</button>
+      <button class="btn keylock on" id="keylock-a"
+              title="Key lock: original pitch at any tempo">KEY</button>
+      <span class="sync" id="sync-a">SYNC</span>
+    </div>
+    <div class="droplight"></div>
+  </section>
+
+  <!-- ============================ MIXER ============================= -->
+  <section id="mixer">
+    <div id="masterbar">
+      <div class="row"><span class="lbl">MASTER</span
+        ><span class="num big" id="master-bpm">---.-</span></div>
+      <div class="row"><span class="lbl">KEYS</span
+        ><span class="num" id="key-compat">--</span></div>
+      <div class="row"><span class="lbl">PEAK</span
+        ><span class="num" id="s-peak">--</span></div>
+      <div class="row"><span class="lbl">DRIFT</span
+        ><span class="num" id="s-drift">--</span></div>
+      <div class="row"><span class="lbl">MODEL</span
+        ><span class="num" id="s-llm"><i class="dot"></i>--</span></div>
+    </div>
+
+    <div id="upnext">
+      <span class="lbl">Up next</span>
+      <div id="queue-list"></div>
+    </div>
+
+    <div id="transbox">
+      <span class="lbl">Transition</span>
+      <div class="tstyle" id="trans-style">-</div>
+      <div class="trule" id="trans-rule"></div>
+      <div class="tdiv" id="trans-diversity"></div>
+      <!-- Filled from the server's style list on the first state update, so a
+           new style never needs a second copy of its name here. -->
+      <select id="style-pick" title="Transition style for the next blend">
+        <option value="auto">auto (rules decide)</option>
+      </select>
+      <!-- Set arc. Also filled from the server's list. -->
+      <select id="phase-pick" title="Set phase: what intensity the next picks aim for">
+        <option value="auto">phase: auto</option>
+      </select>
+
+    </div>
+
+    <div id="strips">
+      <div class="strip" data-deck="a">
+        <div class="striphead" id="striphead-a">A</div>
+        <div class="eqs">
+          <label class="eq"><span>HI</span
+            ><input type="range" id="eq-a-high" min="0" max="2" step="0.01" value="1" orient="vertical" /></label>
+          <label class="eq"><span>MID</span
+            ><input type="range" id="eq-a-mid" min="0" max="2" step="0.01" value="1" orient="vertical" /></label>
+          <label class="eq"><span>LOW</span
+            ><input type="range" id="eq-a-low" min="0" max="2" step="0.01" value="1" orient="vertical" /></label>
+        </div>
+        <label class="filt" title="Filter: left low-pass, right high-pass, centre off. Double-click to reset."
+          ><span>FILTER <b id="filt-a-val">OFF</b></span
+          ><input type="range" id="filt-a" min="-1" max="1" step="0.01" value="0" /></label>
+        <div class="faderbox">
+          <canvas class="meter" id="meter-a" width="14" height="150"></canvas>
+          <input type="range" class="fader" id="fader-a" min="0" max="1" step="0.01" value="1" orient="vertical"
+                 title="Deck A channel level" />
+        </div>
+      </div>
+
+      <div class="strip" data-deck="b">
+        <div class="striphead" id="striphead-b">B</div>
+        <div class="eqs">
+          <label class="eq"><span>HI</span
+            ><input type="range" id="eq-b-high" min="0" max="2" step="0.01" value="1" orient="vertical" /></label>
+          <label class="eq"><span>MID</span
+            ><input type="range" id="eq-b-mid" min="0" max="2" step="0.01" value="1" orient="vertical" /></label>
+          <label class="eq"><span>LOW</span
+            ><input type="range" id="eq-b-low" min="0" max="2" step="0.01" value="1" orient="vertical" /></label>
+        </div>
+        <label class="filt" title="Filter: left low-pass, right high-pass, centre off. Double-click to reset."
+          ><span>FILTER <b id="filt-b-val">OFF</b></span
+          ><input type="range" id="filt-b" min="-1" max="1" step="0.01" value="0" /></label>
+        <div class="faderbox">
+          <canvas class="meter" id="meter-b" width="14" height="150"></canvas>
+          <input type="range" class="fader" id="fader-b" min="0" max="1" step="0.01" value="1" orient="vertical"
+                 title="Deck B channel level" />
+        </div>
+      </div>
+    </div>
+
+    <div id="xfbox">
+      <div class="xflabels"><span>A</span><span>B</span></div>
+      <input type="range" id="xfader" min="0" max="1" step="0.01" value="0"
+             title="Crossfader (equal power)" />
+    </div>
+
+    <div id="overrides">
+      <button class="btn small" id="btn-freeze">FREEZE</button>
+      <button class="btn small" id="btn-go">GO</button>
+      <button class="btn small" id="btn-cue-a">CUE A</button>
+      <button class="btn small" id="btn-cue-b">CUE B</button>
+      <button class="btn small on" id="btn-quantize"
+              title="Quantize: snap loops and jumps to the beat grid">QUANT</button>
+    </div>
+
+    <div id="panics">
+      <button class="btn panic cut" id="btn-cut">CUT</button>
+      <button class="btn panic kill" id="btn-kill">KILL BASS</button>
+      <button class="btn panic stop" id="btn-stop">STOP</button>
+    </div>
+  </section>
+
+  <!-- ============================ DECK B ============================ -->
+  <section class="deck" id="deck-b" data-deck="b">
+    <div class="deck-head">
+      <span class="badge" id="badge-b">-</span>
+      <span class="title" id="title-b">no track loaded</span>
+    </div>
+
+    <div class="wave-wrap"><canvas class="wave" id="wave-b"
+      title="Drag the triangle at bar 1 to move the grid"></canvas></div>
+    <div class="wzoom" title="Zoom: whole track down to one bar (or scroll on the waveform)">
+      <button class="btn pf" id="wz-out-b">&minus;</button>
+      <span class="num" id="wz-lbl-b">full</span>
+      <button class="btn pf" id="wz-in-b">+</button>
+    </div>
+    <div class="gridctl" id="gridctl-b"></div>
+
+    <div class="deck-body">
+      <canvas class="platter" id="platter-b" width="200" height="200"></canvas>
+      <div class="readout">
+        <div class="row"><span class="lbl">BPM</span
+          ><span class="num big" id="bpm-b">---.-</span></div>
+        <div class="row"><span class="lbl">STRETCH</span
+          ><span class="num" id="stretch-b">--</span></div>
+        <div class="row"><span class="lbl">KEY</span
+          ><span class="num" id="key-b">--</span></div>
+        <div class="row"><span class="lbl">ELAPSED</span
+          ><span class="num" id="elapsed-b">-:--</span></div>
+        <div class="row"><span class="lbl">REMAIN</span
+          ><span class="num warnable" id="remain-b">-:--</span></div>
+      </div>
+    </div>
+
+    <div class="pending" id="pending-b" hidden></div>
+
+    <div class="hotcues" id="hotcues-b"></div>
+    <div class="perf" id="perf-b"></div>
+
+    <div class="transport">
+      <button class="btn play" id="play-b">PLAY</button>
+      <button class="btn cue" id="cuept-b">CUE</button>
+      <button class="btn keylock on" id="keylock-b"
+              title="Key lock: original pitch at any tempo">KEY</button>
+      <span class="sync" id="sync-b">SYNC</span>
+    </div>
+    <div class="droplight"></div>
+  </section>
+</main>
+
+<!-- ============================ BOTTOM ============================== -->
+<section id="bottom">
+  <div id="library" class="panel">
+    <div class="panelhead">
+      <button class="btn small" id="lib-toggle">LIBRARY</button>
+      <input id="lib-filter" type="text" placeholder="filter..." autocomplete="off" />
+      <button class="btn small sort" id="sort-title" data-key="title">TITLE</button>
+      <button class="btn small sort" id="sort-bpm" data-key="bpm">BPM</button>
+      <button class="btn small sort" id="sort-key" data-key="camelot">KEY</button>
+      <span class="count" id="lib-count"></span>
+    </div>
+    <div id="lib-rows"></div>
+  </div>
+
+  <!-- The preview: what the next transition measured when it was rendered in
+       the pre-roll, and what that changed. Down here rather than in the mixer
+       column, which has no height to spare: there it took 145 px out of the
+       channel strips, the one row that flexes. -->
+  <div id="previewbox" class="panel">
+    <div class="panelhead">
+      <span class="lbl">PREVIEW</span>
+      <span class="pstate" id="prev-status">-</span>
+      <span class="num" id="prev-time"></span>
+    </div>
+    <div id="prev-body">
+      <div class="pmeas" id="prev-meas"></div>
+      <div class="pdiff" id="prev-diff"></div>
+    </div>
+  </div>
+
+  <div id="chat" class="panel">
+    <div class="panelhead"><span class="lbl">CHAT</span></div>
+    <div id="log"></div>
+    <form id="entry" autocomplete="off">
+      <input id="input" type="text" placeholder="give me something harder" />
+      <button class="btn small" type="submit">Send</button>
+    </form>
+  </div>
+</section>
+
+<script src="/static/wavemath.js"></script>
+<script src="/static/dragmath.js"></script>
+<script src="/static/app.js"></script>
