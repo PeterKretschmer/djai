@@ -37,7 +37,7 @@ transition library, the supervisor and the reasoning behind each — see
 ## Install
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/PeterKretschmer/djai/
 cd djai-github
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
