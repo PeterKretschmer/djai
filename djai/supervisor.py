@@ -143,6 +143,16 @@ class Rejection:
     reason: str
 
 
+#: Schema version of the session log, written as its first line. A reader six
+#: months from now needs to know which shape it is holding, and the eval
+#: harness (SPEC §7) refuses a log whose version it does not understand rather
+#: than quietly misreading it.
+#:
+#: 1 -- events only.
+#: 2 -- adds `decision` and `outcome` records: a decision carries the feature-bus
+#:      snapshot that triggered it, and an outcome closes the window over it.
+LOG_SCHEMA_VERSION: int = 2
+
 #: A session log rotates once it reaches this size and keeps this many gzipped
 #: predecessors. At the measured rate a 30-minute log is well under a megabyte;
 #: this bounds the pathological case, not the normal one.
@@ -184,6 +194,15 @@ class SessionLog:
         self._run_started: float = 0.0
         self._run_first_ts: str = ""
         self._run_count: int = 0
+        #: Decisions issued so far; the id a decision is joined to its outcome
+        #: by. Monotonic within a session, which is all a replay needs.
+        self._decisions: int = 0
+        self.write(
+            "log_opened",
+            schema_version=LOG_SCHEMA_VERSION,
+            trigger="session log opened",
+            action=f"schema v{LOG_SCHEMA_VERSION}",
+        )
 
     def write(self, event: str, **fields: Any) -> dict:
         record = {
@@ -224,6 +243,49 @@ class SessionLog:
             if self._file.tell() >= LOG_ROTATE_BYTES:
                 self._rotate()
         return record
+
+    def decision(
+        self, kind: str, snapshot: Any, action: str, **fields: Any
+    ) -> str:
+        """Log a decision together with the state that caused it (SPEC §7).
+
+        ``snapshot`` is a :class:`djai.telemetry.Snapshot` -- the feature bus
+        row the decision was taken on -- or None where a decision genuinely had
+        no audio context (before the first block). Storing it beside the action
+        is what makes the log replayable: prose says *that* something was
+        decided, the snapshot says *what it was decided on*.
+
+        Returns the decision id, to be passed to :meth:`outcome` when the
+        window over it closes.
+        """
+        self._decisions += 1
+        did = f"d{self._decisions}"
+        # The event keeps its own name, and gains `decision_id` and the
+        # snapshot. Additive on purpose: every existing reader of this log --
+        # the UI, the feedback learner, the tests -- goes on seeing the event
+        # it already knows, and the eval harness finds decisions by the
+        # presence of `decision_id`.
+        self.write(
+            kind,
+            decision_id=did,
+            action=action,
+            snapshot=snapshot.as_dict() if snapshot is not None else None,
+            **fields,
+        )
+        return did
+
+    def outcome(self, decision_id: str, snapshot: Any, **fields: Any) -> dict:
+        """Close the outcome window over a decision.
+
+        The pair is what an evaluation compares: what the system saw, what it
+        did, and what the room was doing a while later.
+        """
+        return self.write(
+            "outcome",
+            decision_id=decision_id,
+            snapshot=snapshot.as_dict() if snapshot is not None else None,
+            **fields,
+        )
 
     def _emit(self, record: dict) -> None:
         """Write one line and flush it. Lock held."""
@@ -369,6 +431,10 @@ class Supervisor:
             # A brake or a spin is moving this deck's rate on purpose. It is
             # leaving the mix; correcting its phase would fight the gesture.
             return None
+        if getattr(deck, "reversing", False):
+            # A slip reverse: off the clock on purpose for a beat or two, and
+            # it resumes from its slip position, in phase, by construction.
+            return None
         if deck.loop_active:
             # A looping deck is deliberately not advancing with the master
             # clock, so every lap reads as growing drift. Correcting it would
@@ -378,14 +444,18 @@ class Supervisor:
             return None
         key = deck.name
         actual = phrase.beat_at_frame(deck.track.analysis, position)
+        # In this deck's own beats: a half-time deck advances one beat for
+        # every two of the master's.
+        ratio = float(getattr(deck, "metric_ratio", 1.0)) or 1.0
+        scaled = master_beat / ratio
 
         if self._offset_seq.get(key) != deck.load_seq:
             self._offset_seq[key] = deck.load_seq
             self._beat_offset[key] = self._baseline_offset(
-                deck, actual, master_beat, master
+                deck, actual, scaled, master, ratio
             )
             return None
-        return master_beat + self._beat_offset[key]
+        return scaled + self._beat_offset[key]
 
     def _baseline_offset(
         self,
@@ -393,6 +463,7 @@ class Supervisor:
         actual: float,
         master_beat: float,
         master: tuple[Deck, float] | None,
+        ratio: float = 1.0,
     ) -> float:
         """The beat offset to hold this deck at, captured once per load.
 
@@ -410,6 +481,12 @@ class Supervisor:
         """
         raw = actual - master_beat
         if deck.name == self.engine.master_deck or master is None:
+            return raw
+        if abs(ratio - 1.0) > 1e-6:
+            # Counted half or double: its bars are not the master's bars, so
+            # "how many bars apart" has no answer to round to. The phase it
+            # was cued at is the phase to hold, which is what the raw offset
+            # says, and the entry was placed on a downbeat to begin with.
             return raw
 
         master_deck, _master_position = master
@@ -445,7 +522,10 @@ class Supervisor:
         native = deck.track.analysis.bpm
         if master_bpm <= 0 or native <= 0:
             return deck.rate
-        return master_bpm / native
+        # A deck counted half or double against the master is already at the
+        # right speed: matching it to the master's own number would double it.
+        ratio = float(getattr(deck, "metric_ratio", 1.0)) or 1.0
+        return master_bpm / (native * ratio)
 
     def check_drift(self) -> None:
         # One consistent snapshot: comparing a deck position against the beat
@@ -1109,8 +1189,11 @@ class Supervisor:
                 return "both decks must have a track loaded"
             if cmd.total_frames <= 0:
                 return "transition length must be positive"
+            # Compare the decks as they are counted, not as they are clocked:
+            # 87 BPM under 174 is a half-time mix, not a 50% tempo error.
+            dst_ratio = float(getattr(dst, "metric_ratio", 1.0)) or 1.0
             bpm_delta = abs(
-                (dst.track.analysis.bpm * dst.rate)
+                (dst.track.analysis.bpm * dst.rate * dst_ratio)
                 - (src.track.analysis.bpm * src.rate)
             )
             reference = src.track.analysis.bpm * src.rate
@@ -1135,7 +1218,11 @@ class Supervisor:
             if cmd.origin == "user":
                 return None
             analysis = src.track.analysis
-            total = analysis.duration_s * SAMPLE_RATE
+            # Measured against the audio the deck actually has: a truncated
+            # file ends long before its analysed duration, and its last bar is
+            # not "17% of the track".
+            total = min(analysis.duration_s * SAMPLE_RATE,
+                        float(getattr(src.track, "source_frames", 0) or float("inf")))
             frames_ahead = (
                 0
                 if cmd.is_immediate

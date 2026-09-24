@@ -28,7 +28,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+# objgraph: back-reference chains for tracking down retained audio buffers in
+# the soak harnesses (scratch/). Diagnostic only -- never imported by djai.
+dev = ["pytest>=7.4", "objgraph>=3.6"]
 # Beat This! (MIT, code and weights) for offline beat, downbeat and grid
 # confidence analysis -- see djai/beat_tracker.py. Only `analyze` imports it.
 # For the GPU, install PyTorch from its CUDA index first, e.g.

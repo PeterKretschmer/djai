@@ -78,6 +78,13 @@
       <div id="queue-list"></div>
     </div>
 
+    <div id="cuebox">
+      <span class="lbl">Cue queue</span>
+      <div id="cue-list"></div>
+      <span class="lbl">Suggestions</span>
+      <div id="suggest-list"></div>
+    </div>
+
     <div id="transbox">
       <span class="lbl">Transition</span>
       <div class="tstyle" id="trans-style">-</div>
@@ -88,6 +95,16 @@
       <select id="style-pick" title="Transition style for the next blend">
         <option value="auto">auto (rules decide)</option>
       </select>
+      <!-- The operator's verdict on the transition that just played. It is
+           the only signal in the program about how a mix actually sounded;
+           everything else is measured. -->
+      <button id="btn-worked" class="btn small" title="That transition worked">
+        THAT WORKED
+      </button>
+      <button id="btn-didnt" class="btn small" title="That transition did not work">
+        THAT DIDN'T
+      </button>
+      <span id="feedback-note" class="tdiv"></span>
       <!-- Set arc. Also filled from the server's list. -->
       <select id="phase-pick" title="Set phase: what intensity the next picks aim for">
         <option value="auto">phase: auto</option>
@@ -151,6 +168,7 @@
       <button class="btn small on" id="btn-quantize"
               title="Quantize: snap loops and jumps to the beat grid">QUANT</button>
     </div>
+
 
     <div id="panics">
       <button class="btn panic cut" id="btn-cut">CUT</button>
@@ -234,6 +252,23 @@
     <div id="prev-body">
       <div class="pmeas" id="prev-meas"></div>
       <div class="pdiff" id="prev-diff"></div>
+    </div>
+    <!-- The set at a glance: what the room got bar by bar, where the plan is
+         going, what autonomous selection will not touch, and the last line
+         the chat could not understand. -->
+    <div id="set-body">
+      <div id="overrides2">
+        <button class="btn small" id="btn-mode"
+                title="Autonomous, or co-pilot: the AI proposes and you say GO">AUTO</button>
+        <button class="btn small" id="btn-mc"
+                title="MC on the mic: dip the music 12 dB and hold the blend">MC</button>
+        <button class="btn small" id="btn-why"
+                title="Why: the last decisions, read back from the log">WHY</button>
+      </div>
+      <div class="srow"><span class="lbl">ENERGY</span><span class="spark" id="energy-spark">-</span></div>
+      <div class="srow"><span class="lbl">PLAN</span><span id="plan-list">-</span></div>
+      <div class="srow"><span class="lbl">QUARANTINE</span><span id="quarantine-list">-</span></div>
+      <div class="srow warn" id="parse-fail"></div>
     </div>
   </div>
 

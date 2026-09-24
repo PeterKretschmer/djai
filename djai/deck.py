@@ -25,6 +25,7 @@ audio thread; the callback only indexes that table and runs the filter.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
@@ -37,7 +38,9 @@ import soundfile as sf
 from scipy.signal import butter, sosfilt
 
 from djai import config
-from djai.analysis import HOT_CUE_SR, TrackAnalysis
+from djai.analysis import BEATS_PER_BAR, HOT_CUE_SR, TrackAnalysis
+
+log = logging.getLogger(__name__)
 
 # --- audio format ------------------------------------------------------------
 
@@ -47,6 +50,16 @@ SAMPLE_RATE: int = 44100
 #: waveform discontinuity that would otherwise click on every lap, short
 #: enough that the loop still lands on the beat it was cut to.
 _LOOP_XFADE: int = 64
+
+#: Frames over which a deck fades to silence as it reaches the end of its
+#: audio. ~5 ms. A file whose last sample is not silent -- truncated, cut
+#: mid-note, or a test tone -- otherwise stops dead in one sample at full level.
+#: Found by the Phase 2.3 fuzz once Phase 3 let a live deck run to its end.
+_END_FADE: int = 220
+#: And it is silent this many frames before the last one, so the EQ's
+#: crossover filters ring out on silence while the deck is still rendering:
+#: an ended deck stops running them, which would cut a ringing tail short.
+_END_GUARD: int = 1024
 
 # Hot cue positions are stored in deck frames. analysis.py cannot import this
 # module (it would be circular), so the agreement is asserted from this side.
@@ -166,6 +179,20 @@ def load_track(analysis: TrackAnalysis) -> LoadedTrack:
         audio = librosa.resample(
             audio.T.astype(np.float32), orig_sr=file_sr, target_sr=SAMPLE_RATE
         ).T
+
+    # A decoded file can contain NaN or Inf -- a bad encoder, a corrupt
+    # sector, a float WAV written by something careless. Scrubbed here, on the
+    # thread that decoded it, because downstream there is nowhere cheap to do
+    # it: a single NaN spreads through the mix and latches the master
+    # limiter's gain to NaN for the rest of the night. The limiter has its own
+    # backstop for audio that goes bad after this point; this is the cheap
+    # place to catch the common case.
+    if not np.isfinite(audio).all():
+        bad = int((~np.isfinite(audio)).sum())
+        log.warning(
+            "%s: %d non-finite sample(s) replaced with silence", analysis.path, bad
+        )
+        np.nan_to_num(audio, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Loudness normalisation, applied here at load and never in the callback:
     # one scalar over the decoded buffer, on the thread that decoded it, so
@@ -451,6 +478,15 @@ class Deck:
         #: observe a half-updated region.
         self._loop: tuple[float, float] = (0.0, 0.0)
 
+        #: How many master beats this deck counts per beat of its own: 1 for a
+        #: straight mix, 2 when it is playing half-time under the master, 0.5
+        #: when it is double-time over it. Written by the control layer when a
+        #: metric transition is planned and read by the supervisor, which would
+        #: otherwise measure a half-time deck as drifting a beat every beat and
+        #: stretch it to twice its speed trying to fix that. The audio thread
+        #: never looks at it: the deck plays at its own tempo either way.
+        self.metric_ratio: float = 1.0
+
         #: Set by the engine when a deck is stopped while it was running the
         #: same audio: an operator's pause, as opposed to a fresh cue or a
         #: track that played out. Cleared by :meth:`attach`, so a new load is
@@ -461,6 +497,23 @@ class Deck:
         #: re-cueing the *same* track is still a new playhead, and treating it
         #: as continuous makes stale state look like enormous drift.
         self.load_seq: int = 0
+
+        # --- grid constants, cached for the feature bus ---
+        #
+        # The callback publishes a telemetry row every block (djai.telemetry),
+        # and musical time needs beat 0, the beat period and where the bar line
+        # sits. Those come off `analysis`, through properties, and they only
+        # change when a record changes -- so they are computed once in `attach`
+        # and read here as plain floats. A property call per block, for numbers
+        # that were the same last block, is exactly the work the audio thread
+        # must not do.
+        self.grid_bpm: float = 0.0
+        self.grid_beat0_s: float = 0.0
+        self.grid_beat_period_s: float = 0.0
+        self.grid_downbeat_offset_beats: float = 0.0
+        #: Per-beat RMS of the attached track, as an array the callback can
+        #: index. None when nothing is loaded.
+        self._beat_rms_np: np.ndarray | None = None
 
         # Rate is not ramped: it retunes the resampler, and a step change in
         # pitch is inaudible as a click. Everything else is ramped per block.
@@ -498,6 +551,17 @@ class Deck:
         #: the next block can crossfade the jump instead of clicking.
         self._exit_pos: float = 0.0
         self._exit_pending: bool = False
+        #: Playing backwards, slip-style (Phase 2.1 glue). The slip position
+        #: advances forward meanwhile, exactly as it does under a loop.
+        self.reversing: bool = False
+        #: The pending exit crossfade is a change of direction (a reverse
+        #: starting or ending), so its continuation runs the other way.
+        self._exit_flip: bool = False
+        #: A seam crossfade cut short by the end of a block, finished at the
+        #: start of the next: frames of it left, and where its continuation
+        #: reads from next (buffer units). 0 when nothing is carried.
+        self._seam_rest: int = 0
+        self._seam_cont: float = 0.0
 
         # --- loop seam crossfade (preallocated) ---
         self._xf_pos = np.zeros(_LOOP_XFADE, dtype=np.float64)
@@ -509,7 +573,11 @@ class Deck:
         self._xf_a = np.zeros((_LOOP_XFADE, CHANNELS), dtype=DTYPE)
         self._xf_b = np.zeros((_LOOP_XFADE, CHANNELS), dtype=DTYPE)
         self._xf_cont = np.zeros((_LOOP_XFADE, CHANNELS), dtype=DTYPE)
-        ramp = (np.arange(1, _LOOP_XFADE + 1, dtype=np.float64) / _LOOP_XFADE)
+        # Raised cosine, not linear: flat at both ends, so the crossfade adds
+        # no corner of its own where it starts and stops (a linear one left a
+        # slope step at its last sample, seen in the Phase 2.3 fuzz).
+        t = np.arange(1, _LOOP_XFADE + 1, dtype=np.float64) / _LOOP_XFADE
+        ramp = 0.5 - 0.5 * np.cos(np.pi * t)
         self._xf_w = ramp.astype(DTYPE).reshape(-1, 1)
         self._xf_iw = (1.0 - ramp).astype(DTYPE).reshape(-1, 1)
 
@@ -554,6 +622,19 @@ class Deck:
         # --- resonant filter: coefficients come from the prebuilt table ---
         self._flt_table, self._flt_wet = filter_tables()
         self._flt_zi = np.zeros((1, 2, CHANNELS), dtype=np.float64)
+        #: Wet level at the end of the last sub-block, and a preallocated ramp
+        #: from it to the next: the wet level is interpolated per sample, not
+        #: stepped per sub-block (Phase 2.3; a step measured 2,000x a tone's
+        #: own second difference when the knob left the detent in one move).
+        self._flt_wet_prev: float = 0.0
+        #: The table entry the filter ran with last sub-block: when the next
+        #: one differs, both are run from the same state and crossfaded, so a
+        #: coefficient change never lands as a step (it did on the low-pass
+        #: side, measured at up to 670x a tone's own second difference).
+        self._flt_coef: tuple[int, int, int] = (-1, -1, -1)
+        self._flt_mix = np.zeros((MAX_BLOCK, CHANNELS), dtype=np.float64)
+        self._flt_steps = np.arange(1, MAX_BLOCK + 1, dtype=np.float64).reshape(-1, 1)
+        self._flt_ramp = np.zeros((MAX_BLOCK, 1), dtype=np.float64)
         #: Which response the filter state belongs to: 0 low-pass, 1 high-pass,
         #: -1 bypassed with its state cleared.
         self._flt_side: int = -1
@@ -563,16 +644,20 @@ class Deck:
     def attach(self, track: LoadedTrack | None, start_frame: int = 0) -> None:
         """Publish a preloaded track to this deck. The decode already happened."""
         self.track = track
+        self._cache_grid(track)
         self.position = float(start_frame)
         # A new playhead is a new straight-through timeline.
         self._slip = self.position
         self._exit_pending = False
+        self._seam_rest = 0
+        self.reversing = False
         self.paused = False
         self.ended = track is None
         self.load_seq += 1
         self._swap_from = None
         self._flt_zi.fill(0.0)
         self._flt_side = -1
+        self._flt_wet_prev = 0.0
         for zi in (
             self._zi_lp_low,
             self._zi_hp_low,
@@ -580,6 +665,59 @@ class Deck:
             self._zi_hp_high,
         ):
             zi.fill(0.0)
+
+    def _cache_grid(self, track: LoadedTrack | None) -> None:
+        """Freeze this track's grid constants for the callback to read.
+
+        Control thread (whoever ran ``attach``), once per load. The arithmetic
+        mirrors :func:`djai.phrase.beat_at_frame` and
+        :func:`djai.phrase.downbeat_offset_beats` -- deliberately inlined
+        rather than imported, because ``phrase`` imports ``deck`` and the cycle
+        would be worse than the duplication. The rounding before the modulo is
+        the part that matters: a first downbeat on beat 0 computes as a tiny
+        negative float, and ``%`` would map it to ~3.9999 and shift every
+        phrase boundary by a bar.
+        """
+        if track is None:
+            self.grid_bpm = 0.0
+            self.grid_beat0_s = 0.0
+            self.grid_beat_period_s = 0.0
+            self.grid_downbeat_offset_beats = 0.0
+            self._beat_rms_np = None
+            return
+        analysis = track.analysis
+        beats = analysis.beats_np
+        self.grid_bpm = float(analysis.bpm)
+        self.grid_beat_period_s = float(analysis.beat_period)
+        self.grid_beat0_s = float(beats[0]) if beats.size else 0.0
+        if analysis.downbeats and beats.size and self.grid_beat_period_s > 0.0:
+            off = (
+                float(analysis.first_downbeat) - self.grid_beat0_s
+            ) / self.grid_beat_period_s
+            self.grid_downbeat_offset_beats = float(round(off) % BEATS_PER_BAR)
+        else:
+            self.grid_downbeat_offset_beats = 0.0
+        rms = getattr(analysis, "beat_rms", None)
+        self._beat_rms_np = (
+            np.asarray(rms, dtype=np.float64) if rms else None
+        )
+
+    def current_beat_energy(self) -> float:
+        """Per-beat RMS under the playhead. **Audio thread safe.**
+
+        One integer index into a preallocated array: no search, no allocation.
+        0.0 when nothing is loaded or the playhead is off the grid.
+        """
+        rms = self._beat_rms_np
+        if rms is None or rms.size == 0 or self.grid_beat_period_s <= 0.0:
+            return 0.0
+        beat = int(
+            (self.position / SAMPLE_RATE - self.grid_beat0_s)
+            / self.grid_beat_period_s
+        )
+        if beat < 0 or beat >= rms.size:
+            return 0.0
+        return float(rms[beat])
 
     def set_gain(self, g: float, immediate: bool = False) -> None:
         self.gain.jump(g) if immediate else self.gain.set(g)
@@ -633,6 +771,13 @@ class Deck:
         ``load_seq`` is bumped because the supervisor's phase baseline for the
         old timeline no longer applies to the new one.
         """
+        if self.playing and frames != 0.0:
+            # The playhead lands mid-waveform: crossfade from where straight
+            # playback would have gone, as a loop exit does. (A jump used to be
+            # a raw step; measured at up to 0.33 full scale in one sample.)
+            self._exit_pos = self.position
+            self._exit_pending = True
+            self._exit_flip = False
         self.position += frames
         self._slip += frames
         start, length = self._loop
@@ -641,7 +786,17 @@ class Deck:
         self.load_seq += 1
 
     def resync(self, frame: float) -> None:
-        """Hard-set the playhead. Supervisor intervention only."""
+        """Hard-set the playhead. Supervisor intervention only.
+
+        Crossfaded from where straight playback would have gone, as a jump is:
+        a raw step here was a 1.54e-2 click on every hard resync (measured on
+        a 30 ms desync mid-blend). ``load_seq`` is left alone -- the resync
+        restores the supervisor's baseline, it does not replace it.
+        """
+        if self.playing and float(frame) != self.position:
+            self._exit_pos = self.position
+            self._exit_pending = True
+            self._exit_flip = False
         self.position = float(frame)
         self._slip = self.position
 
@@ -666,6 +821,14 @@ class Deck:
         if self._loop[1] <= 0.0:
             self._slip = self.position
         self._loop = (float(start_frame), float(length_frames))
+        if self.playing and not (
+            float(start_frame) <= self.position < float(start_frame) + float(length_frames)
+        ):
+            # The playhead is outside the new region, so the first block wraps
+            # it there. Crossfade that jump like any other.
+            self._exit_pos = self.position
+            self._exit_pending = True
+            self._exit_flip = False
 
     def clear_loop(self) -> None:
         """Leave the loop, resuming where straight playback would be.
@@ -678,6 +841,34 @@ class Deck:
         self._loop = (0.0, 0.0)
         self._exit_pos = self.position
         self._exit_pending = True
+        self._exit_flip = False
+        self.position = self._slip
+
+    def set_reverse(self, on: bool) -> None:
+        """Start or stop a slip reverse. AUDIO THREAD (applied from a command).
+
+        Refused while a loop is engaged: both would own the slip position.
+        Stopping resumes from the slip, with the same crossfade a loop exit
+        uses, so the deck lands in phase and without a click.
+        """
+        if on:
+            if self.reversing or self._loop[1] > 0.0:
+                return
+            self._slip = self.position
+            self.reversing = True
+            # Crossfade the turn as well, against the audio that would have
+            # played forwards: the slope then passes through zero instead of
+            # flipping in one sample.
+            self._exit_pos = self.position
+            self._exit_pending = True
+            self._exit_flip = True
+            return
+        if not self.reversing:
+            return
+        self.reversing = False
+        self._exit_pos = self.position
+        self._exit_pending = True
+        self._exit_flip = True
         self.position = self._slip
 
     @property
@@ -754,6 +945,7 @@ class Deck:
         data: np.ndarray,
         last: int,
         n: int,
+        w0: int = 0,
     ) -> None:
         """Crossfade a loop seam. AUDIO THREAD, preallocated throughout.
 
@@ -763,13 +955,12 @@ class Deck:
         samples after the wrap against the audio that would have played had the
         loop not happened, so the two waveforms meet instead of colliding.
 
-        Truncated when the seam falls near the end of a block, which leaves a
-        smaller step rather than none. At 64 frames against a 2048-frame block
-        that is one lap in thirty-two, and the residual is a fraction of the
-        original.
+        A seam near the end of a block is finished at the start of the next
+        (``w0`` is how far into the crossfade that resumes). It used to be cut
+        short there, leaving a smaller step rather than none.
         """
-        k = min(_LOOP_XFADE, n - seam)
-        if k <= 1:
+        k = min(_LOOP_XFADE - w0, n - seam)
+        if k <= 0:
             return
 
         cont_pos = self._xf_pos[:k]
@@ -797,9 +988,13 @@ class Deck:
 
         # raw = looped * w + continuation * (1 - w), w rising from 0 to 1.
         seg = raw[seam:seam + k]
-        np.multiply(seg, self._xf_w[:k], out=seg)
-        np.multiply(cont, self._xf_iw[:k], out=cont)
+        np.multiply(seg, self._xf_w[w0:w0 + k], out=seg)
+        np.multiply(cont, self._xf_iw[w0:w0 + k], out=cont)
         np.add(seg, cont, out=seg)
+        rest = _LOOP_XFADE - w0 - k
+        if rest > 0:
+            self._seam_rest = rest
+            self._seam_cont = seam_pos0 + span + step * k
 
     def _run_filter(self, out: np.ndarray, n: int) -> None:
         """The deck's resonant filter, in place on ``out``. AUDIO THREAD.
@@ -816,8 +1011,17 @@ class Deck:
         """
         fp = self.filter_pos
         start = fp.cur
-        span = fp.target - start
-        fp.cur = fp.target
+        target = fp.target
+        if start * target < 0.0:
+            # A move from one side of the detent to the other takes two
+            # blocks: this one only as far as the centre, fading the old side
+            # out; the next one (the knob is still moving) from the centre to
+            # the target. In one block, a low-pass-to-high-pass jump fades one
+            # side out and the other in within a few dozen samples, and was
+            # measured at a second difference of 6.05e-3 on a 105 Hz tone.
+            target = 0.0
+        span = target - start
+        fp.cur = target
         table = self._flt_table
         wet_levels = self._flt_wet
         top = FILTER_STEPS - 1
@@ -831,24 +1035,58 @@ class Deck:
             idx = int((x if x >= 0.0 else -x) * top + 0.5)
             wet = wet_levels[idx]
             seg = out[i:i + m]
-            if wet <= 0.0:
+            prev = self._flt_wet_prev
+            side = 1 if x > 0.0 else 0
+            if self._flt_side >= 0 and side != self._flt_side and prev > 0.0:
+                # Straight across the detent in one step: fade the old side
+                # out here, and let the new one engage from dry next time.
+                side, wet = self._flt_side, 0.0
+            if wet <= 0.0 and prev <= 0.0:
                 if self._flt_side >= 0:
                     self._flt_zi.fill(0.0)
                     self._flt_side = -1
+                self._flt_wet_prev = 0.0
             else:
-                side = 1 if x > 0.0 else 0
+                if wet <= 0.0:
+                    side = self._flt_side  # fading out: stay on the side in use
                 if side != self._flt_side:
+                    # Engaging from dry. prev is 0 here, so the zero-state
+                    # start of the filter is faded in, never mixed in at level.
                     self._flt_zi.fill(0.0)
                     self._flt_side = side
-                y, self._flt_zi = sosfilt(
-                    table[side, idx, res], seg, axis=0, zi=self._flt_zi
-                )
-                if wet >= 1.0:
+                    self._flt_coef = (side, idx, res)
+                old = self._flt_coef
+                y, zi = sosfilt(table[side, idx, res], seg, axis=0, zi=self._flt_zi)
+                if old != (side, idx, res):
+                    # Same input, same starting state, old coefficients: the
+                    # output the filter would have given had nothing moved.
+                    # Crossfade from it to the new one across the sub-block.
+                    y_old, _ = sosfilt(table[old], seg, axis=0, zi=self._flt_zi)
+                    mix = self._flt_mix[:m]
+                    np.subtract(y, y_old, out=mix)
+                    ramp = self._flt_ramp[:m]
+                    np.multiply(self._flt_steps[:m], 1.0 / m, out=ramp)
+                    np.multiply(mix, ramp, out=mix)
+                    np.add(y_old, mix, out=y)
+                    self._flt_coef = (side, idx, res)
+                self._flt_zi = zi
+                if wet == prev and wet >= 1.0:
                     np.copyto(seg, y, casting="same_kind")
                 else:
                     np.subtract(y, seg, out=y)
-                    np.multiply(y, wet, out=y)
+                    if wet == prev:
+                        np.multiply(y, wet, out=y)
+                    else:
+                        ramp = self._flt_ramp[:m]
+                        np.multiply(self._flt_steps[:m], (wet - prev) / m, out=ramp)
+                        np.add(ramp, prev, out=ramp)
+                        np.multiply(y, ramp, out=y)
                     np.add(seg, y, out=seg)
+                self._flt_wet_prev = wet
+                if wet <= 0.0:
+                    self._flt_zi.fill(0.0)
+                    self._flt_side = -1
+                    self._flt_coef = (-1, -1, -1)
             i += m
 
     def read(self, n: int) -> np.ndarray:
@@ -881,7 +1119,7 @@ class Deck:
         # Writing the step as rate/stretch_rate covers both, and keeps working
         # when the supervisor nudges `rate` a fraction of a percent off the
         # ratio the buffer was stretched at.
-        rate = self.rate
+        rate = -self.rate if self.reversing else self.rate
         start_position = self.position
         stretch = track.stretch_rate
         step = rate / stretch if stretch != 1.0 else rate
@@ -921,6 +1159,9 @@ class Deck:
             end_pos = loop_start + (end_pos - loop_start) % loop_len
             end_base = lo + (end_base - lo) % span
             self._slip += rate * n
+        elif self.reversing:
+            # Where straight playback would be, for the exit.
+            self._slip += self.rate * n
 
         np.floor(pos, out=self._floor[:n])
         np.clip(self._floor[:n], 0.0, float(last), out=self._floor[:n])
@@ -940,6 +1181,13 @@ class Deck:
         np.multiply(raw, frac, out=raw)
         np.add(raw, a, out=raw)
 
+        carried = self._seam_rest
+        if carried:
+            # Finish the previous block's seam before anything else.
+            self._seam_rest = 0
+            self._declick_seam(
+                raw, 0, self._seam_cont, step, 0.0, data, last, n, w0=_LOOP_XFADE - carried,
+            )
         if seam >= 0:
             self._declick_seam(raw, seam, seam_pos0, step, span, data, last, n)
         if self._exit_pending:
@@ -948,7 +1196,10 @@ class Deck:
             # audio the loop would have played next as the continuation.
             self._exit_pending = False
             exit_base = self._exit_pos / stretch if stretch != 1.0 else self._exit_pos
-            self._declick_seam(raw, 0, exit_base, step, 0.0, data, last, n)
+            self._declick_seam(
+                raw, 0, exit_base, -step if self._exit_flip else step, 0.0,
+                data, last, n,
+            )
         swapped = self._swap_from
         if swapped is not None:
             # Key lock changed which buffer is under the playhead. Blend in
@@ -967,11 +1218,31 @@ class Deck:
         # Compared in buffer indices, which is what `last` and `_floor` are in.
         # A looping deck never gets here: its positions are wrapped inside the
         # region, which is by construction inside the track.
+        over = n
         if loop_len <= 0.0 and end_base >= last:
             over = int(np.searchsorted(self._floor[:n], float(last)))
-            if over < n:
-                raw[over:].fill(0.0)
             self.ended = True
+        if (loop_len <= 0.0 and step > 0.0
+                and end_base >= last - (_END_FADE + _END_GUARD) * step):
+            # Fade by each sample's own distance from the end, so the ramp is
+            # continuous across block boundaries wherever the end falls, and
+            # smoothstep-shaped so it has no corners of its own. Measured on
+            # the exact fractional position: on the integer index alone the
+            # fade stair-steps whenever the rate is below 1. In place over
+            # `_floor` and `_frac`, neither of which is read again this block.
+            fade = self._floor[:n]
+            np.add(fade, pos, out=fade)       # `pos` holds the fraction now
+            np.subtract(float(last) - _END_GUARD * step, fade, out=fade)
+            np.multiply(fade, 1.0 / (_END_FADE * step), out=fade)
+            np.clip(fade, 0.0, 1.0, out=fade)
+            shape = self._frac[:n, 0]
+            np.multiply(fade, -2.0, out=shape)
+            np.add(shape, 3.0, out=shape)
+            np.multiply(fade, fade, out=fade)
+            np.multiply(fade, shape, out=fade)
+            np.multiply(raw, fade[:, None], out=raw)
+        if over < n:
+            raw[over:].fill(0.0)
 
         self.position = end_pos
 

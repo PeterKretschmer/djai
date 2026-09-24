@@ -627,10 +627,13 @@ def preview_transition(
     entry_frame_b: float,
     context_bars: float | None = None,
     blocksize: int | None = None,
+    on_render: Any = None,
 ) -> dict[str, Any]:
     """Render the planned transition and measure it. Worker thread only.
 
     Returns the measurement dict, with ``render_ms`` and ``measure_ms`` added.
+    ``on_render``, when given, is handed the render itself before it is
+    measured, so a caller can take its own measurements of the same audio.
     Raises :class:`PreviewError` if the render or the measurement could not be
     completed -- which the caller must treat as "commit the parameters you
     already have", never as a reason to delay the transition.
@@ -654,6 +657,13 @@ def preview_transition(
     except Exception as exc:  # noqa: BLE001 - any failure means "commit"
         raise PreviewError("render", f"{type(exc).__name__}: {exc}") from exc
     render_ms = (time.perf_counter() - t_start) * 1000.0
+    if on_render is not None:
+        # The critic measures this same render rather than making its own:
+        # a second render of the same parameters is ~900 ms of the budget.
+        try:
+            on_render(result)
+        except Exception as exc:  # noqa: BLE001 - measuring must not break the preview
+            log.warning("on_render hook failed: %s", exc)
 
     t_measure = time.perf_counter()
     try:

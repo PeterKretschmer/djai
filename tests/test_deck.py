@@ -183,3 +183,66 @@ def test_hot_path_does_not_grow_allocations():
     grew = sum(s.size_diff for s in snap_after.compare_to(snap_before, "filename"))
     # 500 blocks x 512 frames x 2ch x 4 bytes = 2 MB per retained buffer.
     assert grew < 512 * 1024, f"hot path retained {grew} bytes over 500 blocks"
+
+
+@pytest.mark.parametrize("rate", [1.0, 1.07, 0.93])
+@pytest.mark.parametrize("block", [1024, 333])
+def test_a_deck_reaching_the_end_of_its_audio_fades_rather_than_clicks(rate, block):
+    """Phase 3 regression: a file whose last sample is not silent stopped dead.
+
+    Found by the Phase 2.3 fuzz once a live deck was allowed to run to the end
+    of a pure-tone buffer at full gain: one sample from 0.07 to 0.
+    """
+    n = SAMPLE_RATE * 2
+    t = np.arange(n) / SAMPLE_RATE
+    tone = (0.5 * np.sin(2 * np.pi * 110.0 * t)).astype(np.float32)
+    base = make_track(n_frames=n)
+    track = LoadedTrack(analysis=base.analysis, audio=np.stack([tone, tone], axis=1))
+    deck = Deck("a")
+    deck.attach(track)
+    deck.playing = True
+    deck.rate = rate
+    deck.gain.jump(1.0)
+    chunks = []
+    while not deck.ended:
+        chunks.append(deck.read(block)[:, 0].astype(np.float64).copy())
+    chunks.append(deck.read(block)[:, 0].astype(np.float64).copy())
+    x = np.concatenate(chunks)[SAMPLE_RATE:]   # past the deck's own start-up
+    d2 = np.abs(x[2:] - 2 * x[1:-1] + x[:-2])
+    tone_d2 = 0.5 * (2 * np.pi * 110.0 * rate / SAMPLE_RATE) ** 2
+    assert d2.max() < 20 * tone_d2, f"end-of-audio step {d2.max():.2e}"
+    assert abs(x[-block:]).max() == 0.0, "and silent after the end"
+
+
+@pytest.mark.parametrize("offset", [0, 128, 384, 768])
+def test_a_filter_move_across_the_detent_is_spread_over_two_blocks(offset):
+    """Phase 3 regression, from the Phase 2.3 fuzz at payload 438.
+
+    A one-block jump from low-pass -0.197 to high-pass +0.927 faded one side
+    out and the other in within a few dozen samples: 6.05e-3 second difference
+    on a 105 Hz tone, over the fuzz's 5e-3 bar. It now reaches the centre in
+    the first block and the target in the second.
+    """
+    n = SAMPLE_RATE * 20
+    t = np.arange(n) / SAMPLE_RATE
+    tone = (0.2 * np.sin(2 * np.pi * 105.0 * t)).astype(np.float32)
+    track = LoadedTrack(analysis=make_track(n_frames=n).analysis,
+                        audio=np.stack([tone, tone], axis=1))
+    deck = Deck("a")
+    deck.attach(track)
+    deck.playing = True
+    deck.rate = 1.0732
+    deck.gain.jump(0.875)
+    deck.eq_high.jump(0.831)
+    deck.set_filter(-0.1971, 0.306)
+    out = [deck.read(1024)[:, 0].astype(np.float64).copy() for _ in range(40)]
+    if offset:
+        out.append(deck.read(offset)[:, 0].astype(np.float64).copy())
+    deck.set_filter(0.9271, 0.306)
+    first = deck.read(1024)[:, 0].astype(np.float64).copy()
+    assert deck.filter_pos.cur == 0.0, "the first block stops at the centre"
+    out += [first] + [deck.read(1024)[:, 0].astype(np.float64).copy() for _ in range(3)]
+    assert deck.filter_pos.cur == pytest.approx(0.9271), "and the second arrives"
+    x = np.concatenate(out)[-6 * 1024:]
+    d2 = float(np.abs(x[2:] - 2 * x[1:-1] + x[:-2]).max())
+    assert d2 < 2e-3, f"detent crossing step {d2:.2e}"

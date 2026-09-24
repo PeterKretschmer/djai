@@ -61,16 +61,23 @@ def test_key_relation(a, b, expected):
 # --- selector ----------------------------------------------------------------
 
 
-def test_rejects_tracks_outside_the_bpm_window():
+def test_rejects_only_tracks_with_no_way_to_reach_them():
+    """Since Phase 5 the window is not a wall: a tempo the playing deck can be
+    ridden to is offered, and only one with no path at all is refused."""
     current = track("cur", 124.0)
     crate = [
         current,
-        track("in_range", 128.0),  # +3.2%
-        track("too_fast", 140.0),  # +12.9%
-        track("too_slow", 100.0),
+        track("in_range", 128.0),   # +3.2%: a straight mix
+        track("ridable", 140.0),    # +12.9%: reachable by riding the deck
+        track("too_slow", 100.0),   # -19.4%: no path, and not half or double
     ]
-    ids = {c.track.track_id for c in rank_candidates(crate, current)}
-    assert ids == {"in_range"}
+    ranked = {c.track.track_id: c for c in rank_candidates(crate, current)}
+    assert set(ranked) == {"in_range", "ridable"}
+    assert ranked["in_range"].tempo_path.technique == "direct"
+    assert ranked["ridable"].tempo_path.technique == "ride"
+    assert ranked["in_range"].score > ranked["ridable"].score, (
+        "a straight mix still outranks a gesture"
+    )
 
 
 def test_never_returns_the_current_track():

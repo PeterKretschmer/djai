@@ -213,6 +213,7 @@ def precompute(analysis, cache_dir: Path, force: bool = False) -> dict:
         sf.write(str(path), part * gain, sample_rate, subtype=subtype)
         manifest["stems"][name] = {
             "peak": round(float(np.max(np.abs(part))), 4),
+            "rms": round(float(np.sqrt(np.mean(np.square(part, dtype=np.float64)))), 6),
             "bytes": path.stat().st_size,
         }
     manifest_path(analysis.track_id, cache_dir).write_text(
@@ -266,3 +267,45 @@ def load_mix(
     else:
         audio = audio[:want]
     return LoadedTrack(analysis=analysis, audio=audio)
+
+def balance(track_id: str, cache_dir: Path) -> dict[str, float] | None:
+    """How a track's energy splits across its stems, as shares summing to 1.
+
+    The closest thing to a timbre description this program has: a track that is
+    mostly drums and bass sits somewhere quite different from one that is
+    mostly voice and pads, whatever their tempo or key. Read from the manifest,
+    so it costs a JSON read rather than four FLAC decodes.
+    """
+    manifest = cached(track_id, Path(cache_dir))
+    if not manifest:
+        return None
+    rms = {name: float(entry.get("rms", 0.0))
+           for name, entry in manifest.get("stems", {}).items()}
+    total = sum(rms.values())
+    if total <= 0:
+        return None
+    return {name: round(value / total, 4) for name, value in rms.items()}
+
+
+def measure_rms(track_id: str, cache_dir: Path) -> dict | None:
+    """Fill in a manifest's per-stem RMS by reading the stems it already has.
+
+    For entries written before the balance was recorded: it decodes rather than
+    separates, so it is seconds per track and not a GPU job.
+    """
+    cache_dir = Path(cache_dir)
+    manifest = cached(track_id, cache_dir)
+    if not manifest:
+        return None
+    if all("rms" in entry for entry in manifest.get("stems", {}).values()):
+        return manifest
+    folder = stems_dir(track_id, cache_dir)
+    gain = float(manifest.get("gain", 1.0)) or 1.0
+    for name in STEM_NAMES:
+        data, _sr = sf.read(str(folder / f"{name}.flac"), dtype="float32", always_2d=True)
+        value = float(np.sqrt(np.mean(np.square(data / gain, dtype=np.float64))))
+        manifest["stems"].setdefault(name, {})["rms"] = round(value, 6)
+    manifest_path(track_id, cache_dir).write_text(
+        json.dumps(manifest, indent=1), encoding="utf-8"
+    )
+    return manifest

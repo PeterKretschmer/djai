@@ -202,3 +202,47 @@ def test_the_real_model_grids_a_steady_track(track, monkeypatch):
     ta = an.analyze_file(track)
     assert ta.bpm == pytest.approx(BPM, abs=0.1)
     assert ta.grid_confidence >= 0.25
+
+
+# --- clipped detector input (Phase 0A root cause) ------------------------------
+#
+# A loudness-war MP3 decodes above full scale -- 99 of the 105 tracks in the
+# reference crate do -- and Beat This! degrades on it. Measured 2026-09-21:
+# "Don't Let Me Down" (peak 1.05) fitted no grid at all raw and 80.003 BPM
+# scaled; "girl$" (peak 1.68) fitted 72.46 raw, a half-time octave error, and
+# 144.98 scaled against a true 145.000.
+
+
+def test_audio_above_full_scale_is_scaled_into_range():
+    y = np.array([1.7, -0.85, 0.0], dtype=np.float64)
+    out = bt._in_range(y)
+    assert float(np.abs(out).max()) == pytest.approx(1.0)
+    # a pure gain: the shape, and so every zero crossing, is untouched
+    assert out[1] / out[0] == pytest.approx(y[1] / y[0])
+
+
+def test_audio_already_in_range_is_passed_through_untouched():
+    y = np.array([0.5, -0.25, 0.0], dtype=np.float64)
+    out = bt._in_range(y)
+    assert out is y  # identity: cannot perturb a grid fitted from valid input
+
+
+def test_the_detector_is_never_handed_audio_above_full_scale(monkeypatch):
+    """The fix has to hold at the boundary, not merely exist as a helper."""
+    seen = {}
+
+    class FakeModel:
+        def __call__(self, y, sr):
+            seen["peak"] = float(np.abs(y).max())
+            return np.array([0.0, 0.5]), np.array([0.0])
+
+    monkeypatch.setattr(bt, "_model", FakeModel())
+    clipped = (1.77 * np.sin(np.linspace(0, 40, 4096))).astype(np.float32)
+    assert float(np.abs(clipped).max()) > 1.0
+    bt.detect(clipped, 22050)
+    assert seen["peak"] <= 1.0
+
+
+def test_an_empty_signal_does_not_divide_by_zero():
+    assert bt._in_range(np.zeros(0)).size == 0
+    assert float(np.abs(bt._in_range(np.zeros(16))).max()) == 0.0

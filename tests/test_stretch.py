@@ -390,7 +390,10 @@ def test_stretch_cache_is_bounded():
 # --- the selector guard ------------------------------------------------------
 
 
-def test_selector_never_offers_a_track_beyond_the_stretch_limit():
+def test_the_deck_is_never_asked_to_stretch_past_its_limit():
+    """Since Phase 5 a track just outside the stretch range is still offered --
+    the playing deck is ridden toward it -- but what the deck is asked to
+    stretch stays inside the limit, which is what this guard is about."""
     from tests.test_selector_intent import track as make
 
     current = make("cur", 128.0)
@@ -402,11 +405,15 @@ def test_selector_never_offers_a_track_beyond_the_stretch_limit():
     ]
     from djai.selector import rank_candidates
 
-    # Even with the preference window opened wide, the hard limit holds.
-    ids = {c.track.track_id for c in rank_candidates(crate, current, bpm_tolerance=0.5)}
-    assert "just_outside" not in ids
-    assert "way_outside" not in ids
-    assert "just_inside" in ids
+    ranked = {c.track.track_id: c for c in rank_candidates(crate, current, bpm_tolerance=0.5)}
+    assert "just_inside" in ranked
+    assert ranked["just_inside"].tempo_path.technique == "direct"
+    assert "just_outside" in ranked, "reachable by riding the playing deck"
+    assert ranked["just_outside"].tempo_path.technique == "ride"
+    assert "way_outside" not in ranked, "+25% is beyond a ride, and half is 80"
+    for candidate in ranked.values():
+        rate = candidate.tempo_path.rate_b
+        assert abs(rate - 1.0) <= config.MAX_STRETCH_RATIO + 1e-9
 
 
 def test_the_selector_limit_matches_what_the_deck_will_accept():
@@ -419,7 +426,10 @@ def test_the_selector_limit_matches_what_the_deck_will_accept():
         for i, d in enumerate(np.linspace(-0.12, 0.12, 25))
     ]
     for cand in rank_candidates(crate, current, bpm_tolerance=0.5):
-        rate = current.bpm / cand.track.bpm
-        assert abs(rate - 1.0) <= config.MAX_STRETCH_RATIO + 0.01, (
+        # The rate the deck actually gets, after the planner has ridden the
+        # playing deck or counted this one half or double -- not the raw ratio
+        # of two printed tempos, which is no longer what is asked of it.
+        rate = cand.tempo_path.rate_b
+        assert abs(rate - 1.0) <= config.MAX_STRETCH_RATIO + 1e-9, (
             f"{cand.track.track_id} needs rate {rate:.4f}, beyond the deck's limit"
         )

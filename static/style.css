@@ -488,8 +488,14 @@ input[type="range"]::-moz-range-thumb {
 .drow { color: var(--ok); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drow.dim { color: var(--dim); }
 
-#overrides { display: flex; gap: 6px; }
-#overrides .btn { flex: 1 1 0; padding: 0 4px; }
+#overrides, #overrides2 { display: flex; gap: 6px; }
+#overrides .btn, #overrides2 .btn { flex: 1 1 0; padding: 0 4px; }
+#set-body { margin-top: 6px; border-top: 1px solid var(--dim); padding-top: 4px; }
+#bottom.collapsed #set-body .srow { display: none; }
+#overrides2 { margin-bottom: 4px; }
+.srow { display: flex; gap: 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.srow.warn { color: var(--warn, #e0a030); white-space: normal; }
+.spark { font-family: monospace; letter-spacing: -1px; }
 #panics { display: flex; gap: 6px; }
 
 /* ---------------- bottom: library + chat ---------------- */
@@ -555,3 +561,12 @@ input[type="range"]::-moz-range-thumb {
 .msg.err { color: var(--bad); }
 #entry { display: flex; gap: 6px; padding: 8px; flex: 0 0 auto; }
 #entry #input { flex: 1 1 auto; }
+
+/* Phase 3.2: cue queue and suggestions */
+#cuebox { display: flex; flex-direction: column; gap: 2px; }
+.qrow.warn { color: var(--warn, #e0a030); }
+.qbtn {
+  font: inherit; font-size: 0.8em; margin-left: 4px; padding: 0 5px;
+  background: transparent; color: inherit; border: 1px solid currentColor;
+  border-radius: 3px; cursor: pointer;
+}

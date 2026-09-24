@@ -181,8 +181,20 @@ def test_an_explicit_out_path_is_always_kept(monkeypatch, tmp_path):
 
 
 def _lines(log: sup.SessionLog) -> list[dict]:
+    """Every record a test wrote, without the log's own header.
+
+    A log opens by declaring its schema version (SPEC §7), so the first line is
+    never one of these tests' events. These tests are about collapsing, and
+    they assert on the whole list, so the header is skipped here rather than in
+    each of them.
+    """
     log._file.flush()
-    return [json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines() if line]
+    records = [
+        json.loads(line)
+        for line in log.path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    return [r for r in records if r.get("event") != "log_opened"]
 
 
 def test_repeated_interventions_within_a_second_are_one_entry_with_a_count(tmp_path):

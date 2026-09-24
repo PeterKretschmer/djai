@@ -36,9 +36,10 @@ from typing import Any
 import numpy as np
 import sounddevice as sd
 
-from djai import config
+from djai import config, telemetry
 from djai import transition as tr
 from djai.commands import (
+    CancelTransition,
     Command,
     Cut,
     KillBass,
@@ -50,6 +51,9 @@ from djai.commands import (
     SetFilter,
     SetGain,
     SetKeyLock,
+    SetMasterGain,
+    SetReverse,
+    SetRiser,
     SwapStems,
     SetLoop,
     SetPitch,
@@ -553,7 +557,16 @@ class Engine:
         cue_device: int | str | None = None,
         cue_channels: tuple[int, int] | None = None,
         recorder: SessionRecorder | None = None,
+        stretch: bool | None = None,
     ) -> None:
+        """``stretch`` -- run a background stretch worker. None follows
+        ``config.TIME_STRETCH_ENABLED``. Offline renders pass False: a
+        throwaway engine drives its callback at once, so no stretched copy can
+        ever be ready for it, and the worker only spawned a thread and a Rubber
+        Band process per render that nothing stopped. Measured before this
+        switch existed: 11 stretch threads alive after a 14-minute set, each
+        holding queued whole tracks -- the 4-hour soak's memory growth.
+        """
         if blocksize > MAX_BLOCK:
             raise ValueError(f"blocksize {blocksize} exceeds deck MAX_BLOCK {MAX_BLOCK}")
         if cue_device is not None and cue_channels is not None:
@@ -587,6 +600,10 @@ class Engine:
         #: so a reader either sees the whole previous block or the whole next
         #: one, never a mixture.
         self._clock: tuple[int, float, float, float] = (0, 0.0, 0.0, 0.0)
+        #: Wait-free telemetry out of the callback (SPEC §1). Readers are the
+        #: monitor thread, the UI and the eval harness; none of them can slow
+        #: the audio thread down, because the writer never looks at them.
+        self.features = telemetry.FeatureBus(config.FEATURE_BUS_CAPACITY)
         self._beats_per_frame: float = 0.0
         self.master_deck: str = "a"
 
@@ -702,9 +719,12 @@ class Engine:
         self._riser_prev: float = 0.0
         self._rs_work = np.zeros((MAX_BLOCK, CHANNELS), dtype=DTYPE)
         self._rs_ramp = np.zeros((MAX_BLOCK, 1), dtype=DTYPE)
-        self._rs_unit = np.minimum(
-            np.arange(1, MAX_BLOCK + 1, dtype=np.float64) / max(1, blocksize), 1.0
-        ).astype(DTYPE).reshape(-1, 1)
+        #: 1, 2, 3, ... -- scaled by the length actually being ramped over.
+        #: It was a 0..1 ramp normalised to the configured block size, which
+        #: left any callback shorter than that half-ramped and the rest to
+        #: land as a step on the next block (Phase 2.3 fuzz: 0.1 full scale in
+        #: one sample, with 1024-frame callbacks on a 2048-frame engine).
+        self._rs_steps = np.arange(1, MAX_BLOCK + 1, dtype=DTYPE).reshape(-1, 1)
 
         # --- master limiter (audio thread only) ---------------------------------
         self._limiter_gain: float = 1.0
@@ -717,6 +737,10 @@ class Engine:
         )
         #: Highest sample the master bus produced this block, before limiting.
         #: This is the number that says whether the mix is running hot.
+        #: Sub-blocks in which non-finite audio reached the limiter and was
+        #: scrubbed. Counted rather than trusted: "cannot happen" and "did not
+        #: happen" are different claims.
+        self.nonfinite_blocks: int = 0
         self.master_peak_in: float = 0.0
         #: And after. Never above :data:`MASTER_CEILING` by construction.
         self.master_peak: float = 0.0
@@ -756,6 +780,10 @@ class Engine:
 
         # --- session recording --------------------------------------------------
         self.recorder = recorder
+        #: What the room hears, for the closed loop (djai.room): a ring the
+        #: callback copies the limited master into, read by one control
+        #: thread. None until attach_output_tap.
+        self.output_tap: _Ring | None = None
 
         # --- fallback / watchdog ------------------------------------------------
         #: Monotonic time the last callback finished. The watchdog in
@@ -768,12 +796,24 @@ class Engine:
         self.fallback: Any = None
 
         self._master_gain: float = 1.0
+        #: Where the master gain was at the end of the last block; the next
+        #: block ramps from here, so a dip never steps.
+        self._master_prev: float = 1.0
+        self._mg_ramp = np.zeros((MAX_BLOCK, 1), dtype=DTYPE)
+
+        # --- cancelling a blend (Phase 2.1) -------------------------------------
+        #: Frames left and total of a cancel fade, the two decks it moves, and
+        #: their levels when it began: (src gain, low, mid, high, dst gain).
+        self._cx_left: int = 0
+        self._cx_total: int = 1
+        self._cx_src: Deck | None = None
+        self._cx_dst: Deck | None = None
+        self._cx_from: tuple[float, float, float, float, float] = (1.0, 1.0, 1.0, 1.0, 0.0)
         self._mix = np.zeros((MAX_BLOCK, CHANNELS), dtype=DTYPE)
         self._stream: sd.OutputStream | None = None
+        want_stretch = config.TIME_STRETCH_ENABLED if stretch is None else stretch
         self._stretcher: _StretchWorker | None = (
-            _StretchWorker(config.STRETCH_CACHE_SIZE)
-            if config.TIME_STRETCH_ENABLED
-            else None
+            _StretchWorker(config.STRETCH_CACHE_SIZE) if want_stretch else None
         )
 
     # --- lifecycle (main thread) --------------------------------------------
@@ -928,6 +968,48 @@ class Engine:
             return
         self._beats_per_frame = deck.track.analysis.bpm * deck.rate / 60.0 / SAMPLE_RATE
 
+    def hand_master_to(self, name: str, rate: float | None = None) -> float:
+        """CONTROL THREAD. Make this deck the beat clock, at its own tempo.
+
+        Called when a transition has finished and the deck that is now the mix
+        is playing at a different tempo from the one the clock was counting --
+        which is what a set that travels from 100 to 128 BPM does. Without it
+        the clock stays on whatever the night opened at, every later track is
+        stretched back to that, and the tempo journey is silently undone.
+
+        Two plain attribute writes, the same ones :meth:`_set_master` makes and
+        the audio thread re-reads each block, as :meth:`retune_master` already
+        does from this thread.
+        """
+        deck = self._decks.get(name)
+        if deck is None or deck.track is None:
+            return self.master_bpm
+        # `rate` is given when the caller knows the rate the deck was *asked*
+        # for: a ride step. The deck's own rate also carries the supervisor's
+        # temporary phase nudges, and a clock that absorbed those would make
+        # each nudge permanent.
+        effective = deck.track.analysis.bpm * max(
+            rate if rate is not None else deck.rate, 1e-6
+        )
+        if effective <= 0:
+            return self.master_bpm
+        self.master_deck = name
+        self._beats_per_frame = effective / 60.0 / SAMPLE_RATE
+        return effective
+
+    def attach_output_tap(self, seconds: float = 8.0) -> tuple[_Ring, int]:
+        """Start copying the master output into a ring. Control thread.
+
+        The ring is allocated here, never in the callback, and published with
+        one rebind. Returns it with the engine frame its first sample will be,
+        so a reader can place what it takes on the set's timeline -- to within
+        the one block that may be in flight while this runs.
+        """
+        tap = _Ring(max(MAX_BLOCK * 2, int(SAMPLE_RATE * seconds)))
+        start = self.frames_played
+        self.output_tap = tap
+        return tap, start
+
     def release_stretches(self, keep_track_ids: set[str]) -> int:
         """CONTROL THREAD. Free stretched copies no deck needs; returns count.
 
@@ -1032,6 +1114,14 @@ class Engine:
         """Apply one command. Assignments and float math only."""
         if isinstance(cmd, LoadTrack):
             deck = self._decks.get(cmd.deck)
+            if self._trans_active and deck is not None and (
+                deck is self._trans_from or deck is self._trans_to
+            ):
+                # Validated when it was queued, but a blend has started since:
+                # swapping the audio under a deck the room is hearing is a
+                # jump. The supervisor refuses this at submit time; this is
+                # the same rule at apply time, where the race is closed.
+                deck = None
             if deck is not None:
                 start = cmd.start_frame
                 if not cmd.is_immediate and self.frames_played > cmd.execute_at:
@@ -1097,9 +1187,17 @@ class Engine:
         elif isinstance(cmd, StartTransition):
             src = self._decks.get(cmd.from_deck)
             dst = self._decks.get(cmd.to_deck)
-            if src is not None and dst is not None and cmd.total_frames > 0:
+            if (
+                src is not None and dst is not None and cmd.total_frames > 0
+                # Never restart a blend part-way: a second transition queued
+                # before the first began arrives here while it is running.
+                and not self._trans_active
+            ):
                 self._trans_from = src
                 self._trans_to = dst
+                # A new blend supersedes a cancel fade still running.
+                self._cx_src = self._cx_dst = None
+                self._cx_left = 0
                 self._trans_frames = 0.0
                 self._trans_total = float(cmd.total_frames)
                 self._trans_bars_per_frame = tr.TRANSITION_BARS / self._trans_total
@@ -1157,6 +1255,24 @@ class Engine:
             if deck is not None:
                 deck.set_eq(cmd.low, cmd.mid, cmd.high)
 
+        elif isinstance(cmd, CancelTransition):
+            self._cancel_transition(cmd.fade_frames)
+
+        elif isinstance(cmd, SetReverse):
+            deck = self._decks.get(cmd.deck)
+            if deck is not None and deck.track is not None:
+                deck.set_reverse(cmd.on)
+
+        elif isinstance(cmd, SetRiser):
+            if cmd.riser is not None:
+                self._riser = cmd.riser
+                self._riser_pos = 0
+                self._riser_prev = 0.0
+            self._riser_gain = float(cmd.gain)
+
+        elif isinstance(cmd, SetMasterGain):
+            self._master_gain = float(cmd.gain)
+
         elif isinstance(cmd, SetGain):
             deck = self._decks.get(cmd.deck)
             if deck is not None:
@@ -1193,6 +1309,22 @@ class Engine:
             if deck is not None and deck.track is not None:
                 deck.set_rate(cmd.rate)
                 deck.manual_pitch = True
+                # Back at its own tempo, a deck has no use for the stretched
+                # copy it was given: playing it would resample by 1/stretch and
+                # put the pitch out by exactly the stretch it was meant to
+                # hide. The master glide ends here on every track, so this is
+                # what leaves a solo track bit-identical to its source file.
+                # swap_audio keeps the playhead and crossfades the buffers, so
+                # it does not click, and it refuses anything that is not this
+                # deck's own track.
+                track = deck.track
+                if (
+                    track.is_stretched
+                    and track.source is not None
+                    and abs(cmd.rate - 1.0) < config.STRETCH_DEADBAND
+                ):
+                    deck.swap_audio(track.source)
+                    deck.load_rate = 1.0
                 if self.master_deck == cmd.deck:
                     # The master's fader moves the master clock with it, so the
                     # other deck is corrected toward the new tempo.
@@ -1423,6 +1555,22 @@ class Engine:
             scratch = self._abs_buf[:n]
             np.abs(sub, out=scratch)
             peak = float(scratch.max())
+            if not math.isfinite(peak):
+                # A single NaN or Inf anywhere upstream -- a corrupt file, a
+                # stretch that went wrong, an FX divide -- otherwise latches
+                # this limiter's gain to NaN, and from then on every block is
+                # multiplied by NaN and the set is over. Measured: 20 bad
+                # samples in one track poisoned 51,442 output samples and the
+                # gain never recovered.
+                #
+                # So non-finite audio is scrubbed to silence here, at the last
+                # stage before the output, whatever produced it. The cost is a
+                # branch per sub-block in the normal case, because this runs
+                # only when the peak is already not a number.
+                np.nan_to_num(sub, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                np.abs(sub, out=scratch)
+                peak = float(scratch.max())
+                self.nonfinite_blocks += 1
             if peak > peak_in:
                 peak_in = peak
 
@@ -1596,7 +1744,7 @@ class Engine:
         if m <= 0:
             return
         ramp = self._rs_ramp[:m]
-        np.multiply(self._rs_unit[:m], gain - prev, out=ramp)
+        np.multiply(self._rs_steps[:m], (gain - prev) / m, out=ramp)
         np.add(ramp, prev, out=ramp)
         work = self._rs_work[:m]
         np.multiply(buf[pos:pos + m], ramp, out=work)
@@ -1613,6 +1761,60 @@ class Engine:
                 self._apply(q.get_nowait())
             except queue.Empty:
                 return
+
+    def _cancel_transition(self, fade_frames: int) -> None:
+        """Begin backing out of the blend in flight. AUDIO THREAD.
+
+        Captures five levels and hands the rest to :meth:`_advance_cancel`.
+        The outgoing deck's filter, loop and rate go back to how the blend
+        found them at once -- the filter knob and gains are block-smoothed, so
+        none of that steps -- and the incoming deck fades out and stops.
+        """
+        src, dst = self._trans_from, self._trans_to
+        if not self._trans_active or src is None:
+            return
+        src.set_filter(0.0, self._knob_resonance)
+        src.clear_loop()
+        if self._trans_rate_mult != 1.0:
+            src.set_rate(self._trans_src_rate)
+        self._trans_rate_mult = 1.0
+        self._cx_from = (
+            src.gain.target, src.eq_low.target, src.eq_mid.target,
+            src.eq_high.target, dst.gain.target if dst is not None else 0.0,
+        )
+        self._cx_src = src
+        self._cx_dst = dst if dst is not src else None
+        if self._cx_dst is not None:
+            self._cx_dst.set_filter(0.0, self._knob_resonance)
+            self._cx_dst.clear_loop()
+        self._cx_total = max(1, int(fade_frames))
+        self._cx_left = self._cx_total
+        self._end_transition()
+
+    def _advance_cancel(self, frames: int) -> None:
+        """Step a cancel fade. Pure float math, like the transition itself."""
+        src, dst = self._cx_src, self._cx_dst
+        if self._cx_left > 0:
+            self._cx_left -= frames
+            t = 1.0 - max(0, self._cx_left) / self._cx_total
+            g, lo, mid, hi, dg = self._cx_from
+            if src is not None:
+                src.gain.set(g + (1.0 - g) * t)
+                src.eq_low.set(lo + (1.0 - lo) * t)
+                src.eq_mid.set(mid + (1.0 - mid) * t)
+                src.eq_high.set(hi + (1.0 - hi) * t)
+            if dst is not None:
+                dst.gain.set(dg * (1.0 - t))
+                if self._cx_left <= 0:
+                    dst.set_eq(low=1.0, mid=1.0, high=1.0)
+            return
+        # The fade has finished and the last ramp to zero has been played:
+        # only now may the incoming deck stop, or its tail would be cut.
+        if dst is not None:
+            if dst.gain.moving:
+                return
+            dst.playing = False
+        self._cx_src = self._cx_dst = None
 
     def _abort_transition(self) -> None:
         """Stop a transition part-way and leave both decks usable. AUDIO THREAD.
@@ -1767,6 +1969,8 @@ class Engine:
 
             if self._trans_active:
                 self._advance_transition(frames)
+            elif self._cx_src is not None:
+                self._advance_cancel(frames)
 
             a = self.deck_a.read(frames)
             b = self.deck_b.read(frames)
@@ -1799,8 +2003,15 @@ class Engine:
             if self._riser_gain > 0.0 or self._riser_prev > 0.0:
                 self._apply_riser(frames, mix)
 
-            if self._master_gain != 1.0:
-                np.multiply(mix, self._master_gain, out=mix)
+            gain, prev = self._master_gain, self._master_prev
+            if gain != prev:
+                ramp = self._mg_ramp[:frames]
+                np.multiply(self._rs_steps[:frames], (gain - prev) / frames, out=ramp)
+                np.add(ramp, prev, out=ramp)
+                np.multiply(mix, ramp, out=mix)
+                self._master_prev = gain
+            elif gain != 1.0:
+                np.multiply(mix, gain, out=mix)
 
             # Last stage before the output, and before the cue tap and the
             # recorder, so all three carry the same audio the room hears.
@@ -1818,6 +2029,9 @@ class Engine:
 
             if self.recorder is not None:
                 self.recorder.capture(mix, frames)
+            tap = self.output_tap
+            if tap is not None:
+                tap.write(mix, frames)
 
             self.frames_played += frames
             self.master_beat += frames * self._beats_per_frame
@@ -1828,7 +2042,25 @@ class Engine:
                 self.deck_b.position,
             )
             self.callbacks += 1
-            self.last_callback_at = time.monotonic()
+            now = time.monotonic()
+            self.last_callback_at = now
+            # One telemetry row per block, last of all, so it describes the
+            # audio that has just gone out rather than the block being built.
+            self.features.publish(
+                # perf_counter, not `now`: on Windows monotonic ticks every
+                # ~15.6 ms, which cannot resolve a bus that answers in
+                # microseconds -- nor order two snapshots inside one tick.
+                time.perf_counter(),
+                self.frames_played,
+                self.master_beat,
+                self._beats_per_frame,
+                self._trans_active,
+                self.master_peak_in,
+                self.master_peak,
+                self.limiter_gain,
+                self.deck_a,
+                self.deck_b,
+            )
         except Exception:
             # An exception escaping the callback tears down the stream. Silence
             # is survivable; a dead stream is not. The monitor thread notices

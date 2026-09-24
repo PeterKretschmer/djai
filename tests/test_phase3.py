@@ -104,7 +104,7 @@ def test_vocal_bars_match_the_annotated_vocals(annotated, capsys):
 
 def test_v8_fields_are_measured_and_round_trip(annotated, tmp_path):
     ta = annotated[0][3]
-    assert ta.analysis_version == 8
+    assert ta.analysis_version >= 8  # v9 kept every v8 field (Phase 2.2)
     assert ta.sections and ta.intensity is not None and ta.vocal_fraction is not None
     an.write_sidecar(ta, tmp_path)
     loaded = an.load_cached(ta.track_id, tmp_path)

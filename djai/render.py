@@ -317,7 +317,9 @@ def render_preview(
     treat a failure as "commit the original parameters", and an exception here
     is the signal for that.
     """
-    engine = Engine(blocksize=blocksize) if blocksize else Engine()
+    # No stretch worker: see Engine(stretch=...). A render engine resamples.
+    engine = (Engine(blocksize=blocksize, stretch=False) if blocksize
+              else Engine(stretch=False))
     block = engine.blocksize
 
     bars = float(params.length_bars)
@@ -458,7 +460,9 @@ def render_transition(
     loaded_a: LoadedTrack = load_track(track_a)
     loaded_b: LoadedTrack = load_track(track_b)
 
-    engine = Engine(blocksize=blocksize) if blocksize else Engine()
+    # No stretch worker: see Engine(stretch=...). A render engine resamples.
+    engine = (Engine(blocksize=blocksize, stretch=False) if blocksize
+              else Engine(stretch=False))
     block = engine.blocksize
 
     if style not in transition.STYLES:

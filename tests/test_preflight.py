@@ -138,16 +138,56 @@ def test_a_healthy_crate_passes(tmp_path, crate, monkeypatch):
 # --- grid ---------------------------------------------------------------------
 
 
-def test_a_weak_beat_grid_fails_and_names_the_worst(tmp_path, crate):
+def test_a_weak_unvouched_grid_is_quarantined_and_named(tmp_path, crate):
+    """0A.5: preflight passes, but the track is quarantined and said out loud."""
     crate[2].grid_confidence = 0.11
     check = preflight.check_grid(crate, threshold=0.5)
+    assert check.ok  # quarantine is not a failure
+    assert crate[2].quarantined
+    warned = " ".join(check.warnings)
+    assert "quarantined" in warned
+    assert "three" in warned and "0.11" in warned
+
+
+def test_a_weak_grid_a_person_vouched_for_fails(crate):
+    """A corrected grid leaves quarantine, so a weak one has nothing to hide
+    behind: its stored confidence no longer describes the cached grid."""
+    crate[2].grid_confidence = 0.11
+    crate[2].grid_manually_corrected = True
+    check = preflight.check_grid(crate, threshold=0.5)
     assert not check.ok
+    assert not crate[2].quarantined
     assert "three" in check.detail and "0.11" in check.detail
+
+
+def test_every_failing_track_is_named_with_its_path_and_no_truncation(crate):
+    """0A.1: the list is the thing you act on, so nothing may be elided."""
+    for t in crate:
+        t.grid_confidence = 0.0
+        t.grid_manually_corrected = True  # so they fail rather than quarantine
+    check = preflight.check_grid(crate, threshold=0.5)
+    assert not check.ok
+    for t in crate:
+        assert t.title in check.detail
+        assert str(t.path) in check.detail
+    assert "more" not in check.detail
+
+
+def test_every_quarantined_track_is_named_with_its_path_and_no_truncation(crate):
+    """0A.1 applies to the quarantine warning too."""
+    for t in crate:
+        t.grid_confidence = 0.0
+    check = preflight.check_grid(crate, threshold=0.5)
+    warned = " ".join(check.warnings)
+    for t in crate:
+        assert t.title in warned
+        assert str(t.path) in warned
+    assert "more" not in warned
 
 
 def test_a_confident_grid_passes(crate):
     check = preflight.check_grid(crate, threshold=0.5)
-    assert check.ok and "all 3" in check.detail
+    assert check.ok and "3 of 3" in check.detail
 
 
 def test_estimated_mix_points_warn_without_failing(crate):

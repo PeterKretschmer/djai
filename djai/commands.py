@@ -16,7 +16,7 @@ panic commands and supervisor interventions use ``IMMEDIATE``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from djai.deck import LoadedTrack
@@ -27,12 +27,35 @@ IMMEDIATE: int = -1
 DeckName = Literal["a", "b"]
 
 
+class CancelToken:
+    """A handle on a group of scheduled commands, so they can be withdrawn together.
+
+    Read on the scheduler thread only; the audio thread never sees one. A
+    single bool, set once: cancelling is idempotent and never undone.
+    """
+
+    __slots__ = ("cancelled", "name")
+
+    def __init__(self, name: str = "") -> None:
+        self.name = name
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def __repr__(self) -> str:
+        return f"CancelToken({self.name!r}{', cancelled' if self.cancelled else ''})"
+
+
 @dataclass(frozen=True)
 class Command:
     """Base for every command. ``origin`` is for the session log only."""
 
     execute_at: int = IMMEDIATE
     origin: str = "system"
+    #: The group this command belongs to (Phase 2.1). Cancelling the token
+    #: withdraws every command still pending under it. Not part of equality.
+    token: CancelToken | None = field(default=None, compare=False, repr=False)
 
     @property
     def is_immediate(self) -> bool:
@@ -269,6 +292,70 @@ class Stop(Command):
 
     def describe(self) -> str:
         return "Stop()"
+
+
+# --- reactivity and glue (Phase 2.1) -------------------------------------------
+# Built on the control thread by djai.glue and the session; the audio thread
+# does assignments and per-block float maths with them, nothing more.
+
+
+@dataclass(frozen=True)
+class CancelTransition(Command):
+    """Abandon the blend in flight and go back to the outgoing track.
+
+    Not an abort: an abort leaves both decks playing at unity. This fades the
+    incoming deck out over ``fade_frames`` and stops it, while the outgoing
+    deck's level and EQ return to unity over the same span, so the room is
+    left with exactly the track it had before the blend began.
+    """
+
+    fade_frames: int = 0
+
+    def describe(self) -> str:
+        return f"CancelTransition(fade {self.fade_frames} frames)"
+
+
+@dataclass(frozen=True)
+class SetReverse(Command):
+    """Play one deck backwards, slip-style, or stop doing so.
+
+    While reversed the deck's straight-through position keeps advancing, and
+    turning reverse off resumes from it: the deck comes out where it would
+    have been, in phase, whatever the reverse ran for.
+    """
+
+    deck: DeckName = "a"
+    on: bool = True
+
+    def describe(self) -> str:
+        return f"SetReverse({self.deck}, {'on' if self.on else 'off'})"
+
+
+@dataclass(frozen=True)
+class SetRiser(Command):
+    """Set the noise riser's level; with ``riser``, start that buffer from its top.
+
+    The buffer is rendered on the control thread (see
+    :func:`djai.engine.render_riser`); the audio thread only reads it. A
+    transition's envelope drives the same level, so this is for use outside
+    one -- the supervisor enforces that.
+    """
+
+    gain: float = 0.0
+    riser: object = field(default=None, compare=False, repr=False)
+
+    def describe(self) -> str:
+        return f"SetRiser({self.gain:.3f}{', new buffer' if self.riser is not None else ''})"
+
+
+@dataclass(frozen=True)
+class SetMasterGain(Command):
+    """The master level, ramped over one block. For volume dips, never a boost."""
+
+    gain: float = 1.0
+
+    def describe(self) -> str:
+        return f"SetMasterGain({self.gain:.3f})"
 
 
 # --- supervisor-only interventions -------------------------------------------

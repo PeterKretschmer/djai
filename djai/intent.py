@@ -57,6 +57,10 @@ ACTIONS: frozenset[str] = frozenset(
         # Where the set is heading. The selector turns the phase into an
         # intensity target; the model still never names a track.
         "set_phase",
+        # A song request (Phase 3.2). The model copies the song name the
+        # operator said into `query`; djai.songs.lookup finds the track. The
+        # model never picks one.
+        "cue_track",
         "none",
     }
 )
@@ -79,6 +83,9 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                 "direction": {"type": "number"},
                 "bars": {"type": "integer"},
                 "phase": {"type": "string", "enum": ["warmup", "build", "peak", "cooldown"]},
+                "query": {"type": "string"},
+                "mode": {"type": "string", "enum": ["next", "now", "after"]},
+                "after": {"type": "integer"},
             },
         },
         "reply": {"type": "string"},
@@ -100,6 +107,7 @@ skip_queued - cancel the queued commands. params: {}
 describe_state - say what is playing. params: {}
 set_transition_style - choose how the next blend is done. params: {"style": one of "bass_swap", "cut", "echo_out", "filter_sweep", "loop_roll_out", "drop_swap", "beat_repeat_in", "backspin", "double_drop", "reverb_out", "brake", "noise_riser", "filter_echo", "auto"}
 set_phase - where the set is: params: {"phase": one of "warmup", "build", "peak", "cooldown"}
+cue_track - play a named song. params: {"query": its name, "mode": "next"|"now"|"after", "after": integer}
 none - anything else. params: {}
 
 Transition styles: bass_swap is the normal blend; cut is a hard switch;
@@ -113,33 +121,49 @@ auto lets the rules decide. You may name a style. You may never choose when a
 transition happens or how long it lasts.
 
 Negative numbers mean calmer, positive mean harder. reply is one short sentence
-said back to the user. Never name a track; you cannot choose tracks.
+said back to the user. Never choose a track yourself.
 
 Example 1
 State: {"bpm": 124, "key": "8A", "bars_in": 48, "transition": false, "played": 3}
 User: give me something harder
-{"action": "next_track", "params": {"energy": 0.8}, "reply": "Cueing something harder for the next phrase."}
+{"action": "next_track", "params": {"energy": 0.8}, "reply": "Cueing something harder."}
 
 Example 2
 State: {"bpm": 128, "key": "9A", "bars_in": 12, "transition": true, "played": 7}
 User: what is playing right now
-{"action": "describe_state", "params": {}, "reply": "128 BPM in 9A, twelve bars into the blend."}
+{"action": "describe_state", "params": {}, "reply": "128 BPM in 9A, mid-blend."}
 
 Example 3
 State: {"bpm": 122, "key": "5A", "bars_in": 80, "transition": false, "played": 2}
 User: keep them blended a while longer
-{"action": "hold_blend", "params": {"bars": 16}, "reply": "Holding the blend another 16 bars."}
+{"action": "hold_blend", "params": {"bars": 16}, "reply": "Holding 16 bars longer."}
 
 Example 4
 State: {"bpm": 126, "key": "7A", "bars_in": 64, "transition": false, "played": 5}
 User: just slam straight into the next one
-{"action": "set_transition_style", "params": {"style": "cut"}, "reply": "Next one comes in on a hard cut."}
+{"action": "set_transition_style", "params": {"style": "cut"}, "reply": "Hard cut next."}
 
 Example 5
 State: {"bpm": 124, "key": "4A", "bars_in": 90, "transition": false, "played": 9}
 User: let this one trail off into a delay
 {"action": "set_transition_style", "params": {"style": "echo_out"}, "reply": "Echoing this one out."}
 """
+
+# --- the narrative critic's note (SPEC §6) --------------------------------------
+
+PLAN_CRITIC_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 10},
+        "note": {"type": "string"},
+    },
+    "required": ["score", "note"],
+}
+
+PLAN_CRITIC_PROMPT = """You review a DJ set plan. Return ONLY JSON:
+{"score": 0-10, "note": one sentence}.
+Judge the story: build, tension and release, contrast, callbacks. Never
+suggest tracks and never mention timings."""
 
 # --- designing a transition ---------------------------------------------------
 
@@ -389,6 +413,29 @@ def _energy_from_text(text: str) -> float:
     return max(-1.0, min(1.0, score))
 
 
+#: "play <song> [next|now|after N]". Generic objects ("play something
+#: harder") are not song names and fall through to the energy rules.
+_CUE_RE = re.compile(
+    r"^\s*(?:play|queue|cue up|put on)\s+(?P<query>.+?)"
+    r"(?:\s+(?P<now>now|right now)|\s+(?P<next>next)|\s+after\s+(?P<n>\d+)(?:\s+tracks?)?)?"
+    r"\s*[.!]?\s*$"
+)
+_GENERIC_OBJECT = re.compile(
+    r"^(something|anything|another|a track|a song|the next|more|some|it|that)\b"
+)
+
+
+def _cue_from_text(lowered: str) -> "Intent | None":
+    m = _CUE_RE.match(lowered)
+    if not m or _GENERIC_OBJECT.match(m.group("query")):
+        return None
+    mode = "now" if m.group("now") else ("after" if m.group("n") else "next")
+    params = {"query": m.group("query").strip(), "mode": mode,
+              "after": int(m.group("n")) if m.group("n") else 0}
+    return Intent(action="cue_track", params=params,
+                  reply=f"Looking up {params['query']!r}.")
+
+
 def keyword_intent(text: str) -> "Intent | None":
     """Best-effort action from the raw text alone. None if nothing matches.
 
@@ -396,6 +443,9 @@ def keyword_intent(text: str) -> "Intent | None":
     or answers badly should cost the user a worse answer, not a dead prompt.
     """
     lowered = (text or "").lower()
+    cue = _cue_from_text(lowered)
+    if cue is not None:
+        return cue
     for pattern, action in _KEYWORD_RULES:
         if not re.search(pattern, lowered):
             continue
@@ -689,6 +739,42 @@ class IntentEngine:
             return None, f"expected an object, got {type(data).__name__}"
         return data, ""
 
+    def critique_plan(
+        self, summary: str, timeout_s: float | None = None
+    ) -> tuple[dict[str, Any] | None, str]:
+        """An advisory narrative note on a set plan. Never raises.
+
+        ``({"score": 0-10, "note": str}, "")`` or ``(None, reason)``. The
+        rules-based critic in djai.planner is the score of record; this only
+        adds a sentence to the log, so any failure simply means no sentence.
+        """
+        if not self.available:
+            return None, "model unavailable"
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": PLAN_CRITIC_PROMPT},
+                {"role": "user", "content": summary[:3000]},
+            ],
+            "stream": False,
+            "format": PLAN_CRITIC_SCHEMA,
+            "keep_alive": "30m",
+            "options": {"num_thread": 6, "temperature": 0.3, "num_predict": 80},
+        }
+        try:
+            response = self._client.post(
+                f"{self.base_url}/api/chat", json=body,
+                timeout=self.timeout_s if timeout_s is None else float(timeout_s),
+            )
+            response.raise_for_status()
+            data = json.loads(response.json()["message"]["content"])
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            return None, f"{type(exc).__name__}"
+        score, note = (data.get("score"), data.get("note")) if isinstance(data, dict) else (None, None)
+        if isinstance(score, bool) or not isinstance(score, (int, float))                 or not 0 <= score <= 10 or not isinstance(note, str):
+            return None, "failed validation"
+        return {"score": float(score), "note": note[:200]}, ""
+
     def revise_transition(
         self, context: dict[str, Any], timeout_s: float | None = None
     ) -> tuple[dict[str, Any] | None, str]:
@@ -768,6 +854,12 @@ class IntentEngine:
         error and stopping.
         """
         started = time.time()
+
+        # A plain "play <song> [next|now|after N]" needs no model: parsed here,
+        # it costs nothing and cannot be misread. Odd phrasings still go on.
+        cue = _cue_from_text((user_text or "").lower())
+        if cue is not None:
+            return cue
 
         if not self.available:
             return self._fallback(

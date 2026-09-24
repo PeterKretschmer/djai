@@ -61,6 +61,12 @@ recordings/
 logs/
 *.npz
 *.jsonl
+*.log
+*.tmp
+
+# Local experiments and cache backups
+scratch/
+cache_backup_*/
 
 # Vendored Rubber Band CLI (install `rubberband` on PATH instead)
 djai/bin/

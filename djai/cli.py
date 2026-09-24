@@ -23,7 +23,9 @@ import argparse
 import dataclasses
 import logging
 import math
+import re
 import queue
+import json
 import sys
 import threading
 from collections import Counter
@@ -34,7 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from djai import analysis as an
-from djai import config, phrase, transition
+from djai import actions as actions_mod
+from djai import config, glue, phrase, transition, understanding
 from djai import preview as preview_mod
 from djai import stems as stems_mod
 from djai import revise as revise_mod
@@ -47,11 +50,16 @@ from djai.analysis import (
 from djai.commands import (
     IMMEDIATE,
     BeatJump,
+    CancelToken,
+    CancelTransition,
     Cut,
     ExitLoop,
     KillBass,
     LoadTrack,
+    SetEQ,
+    SetFilter,
     SetLoop,
+    SetMasterGain,
     SetPitch,
     StartTransition,
     Stop,
@@ -70,7 +78,12 @@ from djai.preflight import run_preflight
 from djai.intent import Intent, IntentEngine
 from djai.scheduler import Scheduler
 from djai.selector import nearest_tempo as select_nearest_tempo
-from djai.selector import rank_candidates, select_next
+from djai.selector import plan_journey, rank_candidates, select_next
+from djai.selector import RIDE_MARGIN_BARS
+from djai import selector as selector_mod
+from djai import planner, room, songs
+from djai.setstate import SetState
+from djai.selector import tempo_path as selector_tempo_path
 from djai.supervisor import DEFAULT_LOG_DIR, SessionLog, Supervisor
 
 #: Safety margin on top of the computed autopilot lead, for decode time.
@@ -111,8 +124,12 @@ djai - type plain English to steer the mix.
   help                    this message
 
 Manual override - matched before the model, so these work when it is down:
-  freeze / resume         stop or restart the autopilot (the track plays on)
+  freeze / resume         take over from the autopilot / hand it back
   go                      blend into the cued track at the next phrase
+  mode assisted|autonomous  co-pilot: I propose, you say `go` (or I blend
+                          at the last call); autonomous: I blend on my own
+  mc on|off               dip the music 12 dB for the mic, hold the blend
+  explain                 why: the last decisions, read back from the log
   force <track>           pin the next track, overriding the selector
   hotcue <n>              jump to a stored marker (set / clear also work)
   style <name|auto>       pick the transition style for the next blend
@@ -199,6 +216,19 @@ class Session:
             notify=self.notify,
         )
 
+        #: The closed loop (SPEC §5): the master output measured bar by bar,
+        #: the optional room mic, and the energy loop. None when disabled.
+        self.room: room.RoomMonitor | None = (
+            room.RoomMonitor(self.engine) if config.CLOSED_LOOP_ENABLED else None
+        )
+        #: Bars since the last room_reading line, so the log gets one per
+        #: :data:`ROOM_LOG_BARS` rather than one per bar.
+        self._room_bars: int = 0
+        #: Whether the loop last reported a deviation past its reach, so that
+        #: is logged once per episode rather than once per bar.
+        self._room_saturated: bool = False
+        self._room_deferred: bool = False
+
         #: Which deck is currently the one the audience hears.
         self.live_deck: str = "a"
         #: The decoded track waiting on the idle deck. Held here rather than
@@ -210,6 +240,65 @@ class Session:
         self._first_track: LoadedTrack | None = None
         #: Set while the autopilot has already armed a transition.
         self._transition_armed: bool = False
+        #: How the last cue's tempo gets from the playing track to it.
+        self.tempo_plan: Any = None
+        #: Ride steps queued but not yet landed, as (engine frame, rate). The
+        #: beat clock follows them -- see _follow_ride.
+        #: Tracks whose audio would not decode this session. A file can rot,
+        #: move onto a disconnected drive or be re-encoded between analysis and
+        #: the gig, and the failure only shows at load. Remembering them is
+        #: what stops the selector reaching for the same broken file every
+        #: tick: without it one unreadable track stalls the whole set, because
+        #: a track that never cues is never marked played.
+        self._unplayable: set[str] = set()
+        #: The cue decision whose outcome window is still open. Closed when
+        #: the transition it led to finishes, which is the first moment there
+        #: is anything to say about how it went.
+        self._cue_decision: str | None = None
+        self._ride_steps: list[tuple[int, float]] = []
+        self._ride_deck: str = "a"
+        #: Every ride and glide step carries this token, so dropping the ride
+        #: withdraws all of them, whatever their origin. Replaced once used.
+        self._ride_token = CancelToken("tempo")
+        #: The energy correction in flight; a new request replaces it.
+        self._energy_token = CancelToken("energy")
+        #: The action language's plan in flight (djai.actions); superseded by
+        #: the next plan.
+        self._action_token: CancelToken | None = None
+        #: One-shot: bring the next cued track in at this ranked mix-in region
+        #: (1 = best) instead of its default mix-in. Set by a `cue` action.
+        self.cue_mix_point: int | None = None
+        #: Hold the beat clock where it is instead of gliding to each
+        #: incoming track's own tempo. Off by default; `lock bpm` turns
+        #: it on for operators who want a fixed-tempo set.
+        self.master_tempo_locked: bool = bool(config.MASTER_TEMPO_LOCKED)
+        self._clock_at_arm: float = 0.0
+        #: Where the set is taking the tempo, in BPM, or None to stay where it
+        #: is. The journey rides toward it a track at a time; nothing jumps.
+        self.tempo_target: float | None = None
+        #: The plan the last cue made: its first step is what was cued, the
+        #: rest is where the set was heading. Shown in the UI, re-made at
+        #: every cue.
+        self.journey: Any = None
+        #: Selector and critic weights, learned from the feedback log. Empty
+        #: until :mod:`djai.feedback` has something to say.
+        self.selector_weights: dict[str, float] = {}
+        self.critic_weights: dict[str, float] = {}
+        #: What the logs said when the weights were last learned, for the UI.
+        self.feedback_summary: dict[str, Any] = {}
+        #: Bars added to (or taken off) every blend's planned length, learned
+        #: from "too early" / "too late" (djai.feedback). 0 until taught.
+        self.timing_bias_bars: int = 0
+        #: The stable model in use (djai.feedback), loaded once at start and
+        #: changed only by `model learn` or `model rollback`.
+        self._stable_model: dict | None = None
+        #: Where tonight's layer starts reading this session's log: after
+        #: whatever a mid-set `model learn` already folded into the stable one.
+        self._night_from: int = 0
+        self._model_checked: bool = False
+        #: The suggestion rows last written to the log, so a UI polling the
+        #: panel writes one line per change rather than one per poll.
+        self._shown_ids: tuple[str, ...] = ()
         #: Stem moves the armed transition will make: one dict per move, for
         #: the log and the UI. See :meth:`_start_stem_moves`.
         self.stem_moves: list[dict] = []
@@ -238,6 +327,17 @@ class Session:
         #: and does not stop recovery from silence, because the whole point of
         #: this program is that the room never hears nothing.
         self.frozen: bool = False
+        #: "autonomous": the autopilot cues and blends on its own. "assisted"
+        #: (co-pilot): it cues and proposes, and blends on the operator's `go`
+        #: -- or at the last call, because the room never hears nothing.
+        self.mode: str = "autonomous"
+        #: The MC has the mic: the master is dipped, arming waits for the last
+        #: call, and the closed loop does not read the dip as a fault.
+        self.mc: bool = False
+        self._mc_token = CancelToken("mc")
+        #: The cued track a hold (co-pilot or MC) was last announced for, so
+        #: the proposal and the last call are each said once.
+        self._held_for: tuple[str, str] | None = None
         #: A track the operator has forced to be next, overriding the selector.
         self._forced_next: TrackAnalysis | None = None
         #: Operator's transition-style preference: a name from
@@ -273,6 +373,29 @@ class Session:
         #: nobody reads mid-set.
         self.design_counts: Counter = Counter()
         self.style_counts: Counter = Counter()
+        #: Transition mode for generated shapes (SPEC §4): "invisible",
+        #: "showy", or "auto" to decide per pair from energy and set phase.
+        self.transition_mode: str = "auto"
+        #: Shape signatures of the transitions armed so far, oldest first. The
+        #: generator's diversity penalty looks back through it.
+        self.shape_history: list[str] = []
+        #: Seed for generation. With the track pair and the transition's index
+        #: it fixes every generated transition, so a set replays exactly.
+        self.set_seed: int = 0
+        #: Persisted set state: the cue queue, history and plan. In memory
+        #: only unless given a path (cmd_play gives it one). See djai.setstate.
+        self.set_state: SetState = SetState()
+        #: Track id -> why the next transition into it must be conservative
+        #: (an echo out into its mix-in, no long beatmatched blend): a
+        #: quarantined grid, or a tempo bridge the operator chose.
+        self._conservative: dict[str, str] = {}
+        #: Track id cued by "play now", waiting for the next tick to arm it.
+        self._play_now: str | None = None
+        #: The set plan (SPEC §6), or None: with none, selection is the journey
+        #: planner alone, exactly as before Phase 3. `plan` or cmd_play makes one.
+        self.set_plan: "planner.Plan | None" = None
+        self.persona: str = "default"
+        self.set_minutes: float = planner.SET_MINUTES
 
         self.fallback_enabled = (
             config.FALLBACK_ENABLED if fallback_enabled is None else fallback_enabled
@@ -338,6 +461,12 @@ class Session:
     # --- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
+        # What the logs already taught, before a note is played: weights for
+        # the critic's measures and the selector's similarities.
+        try:
+            self.reload_feedback()
+        except Exception as exc:  # noqa: BLE001 - a set starts without it
+            log.warning("could not load feedback weights: %s", exc)
         if self.recorder is not None:
             self.recorder.start()
         self.engine.start()
@@ -375,6 +504,11 @@ class Session:
             self.notify("[fallback] nothing decoded yet - safety net NOT armed")
             return False
         player = FallbackPlayer.from_track(track)
+        # The player holds the audio array it needs, so the session's reference
+        # to the opening track has done its job. Keeping it pinned a whole
+        # decoded track for the length of the night.
+        if track is self._first_track:
+            self._first_track = None
         self.watchdog = Watchdog(
             self.engine,
             player,
@@ -422,7 +556,45 @@ class Session:
         except Exception:
             pass
 
+    def attach_set_state(self, path: Path) -> str:
+        """Persist the set to ``path``, resuming it if the last run was killed.
+
+        A file marked ``ended`` belongs to a set that finished cleanly, and a
+        fresh set starts over it. Anything else is a set that was killed
+        mid-flight: its cue queue, what had played, its seed and its plan come
+        back, so a restart carries on rather than starting the night again.
+        """
+        import random
+
+        state = SetState.load(Path(path))
+        if Path(path).exists() and not state.ended:
+            by_id = {t.track_id: t for t in self.crate}
+            for tid in state.history:
+                if tid in by_id and tid not in self.played:
+                    self.played.add(tid)
+                    self.history.append(by_id[tid])
+            self.set_state = state
+            self.set_seed = state.set_seed
+            self.persona = state.persona
+            self.session_log.write(
+                "set_resumed", trigger=str(path),
+                action=f"{len(state.cue_queue)} cue(s), {len(state.history)} played",
+            )
+            return (f"Resumed the set: {len(state.cue_queue)} cue(s) queued, "
+                    f"{len(state.history)} track(s) already played.")
+        self.set_seed = random.randrange(1 << 31)
+        self.set_state = SetState(
+            path=Path(path), set_seed=self.set_seed,
+            cue_queue=self.set_state.cue_queue,
+            history=[t.track_id for t in self.history],
+        )
+        self.set_state.save()
+        return "New set."
+
     def shutdown(self) -> None:
+        if self.set_state.path is not None:
+            self.set_state.ended = True
+            self.set_state.save()
         self._stop.set()
         if self.watchdog is not None:
             self.watchdog.stop()
@@ -451,6 +623,16 @@ class Session:
         self.frozen = frozen
         if not frozen:
             self.manual_held = False
+        elif self._transition_armed and not self.engine.transition_active:
+            # Taking over means the automation makes no further move: a blend
+            # armed 16 bars out would otherwise fire into the operator's hands.
+            # The cued track stays cued (an operator's own cue is never
+            # dropped), so `resume` re-arms the same track. A blend already
+            # running is the fader's and `cancel`'s to take.
+            cued = self._cued
+            self.abort_armed_transition(trigger="operator took over")
+            self._drop_unlanded_ride()
+            self._cued = cued
         self.session_log.write(
             "automation_frozen" if frozen else "automation_resumed",
             trigger="manual override",
@@ -468,6 +650,9 @@ class Session:
         track = _resolve_track(self.crate, needle)
         if track is None:
             return f"No track in the crate matches {needle!r}."
+        reason = self._set_aside(track)
+        if reason is not None:
+            return f"Cannot play {track.title}: {reason}. Re-analyse it first."
         self._forced_next = track
         self.session_log.write(
             "forced_next",
@@ -484,8 +669,485 @@ class Session:
                 return f"Next up: {track.title} (cued now)."
         return f"Next up: {track.title}."
 
+    MODES: tuple[str, ...] = ("autonomous", "assisted")
+
+    def set_mode(self, name: str) -> str:
+        """Autonomous, or assisted (co-pilot): the AI proposes, you say `go`."""
+        name = {"auto": "autonomous", "copilot": "assisted", "co-pilot": "assisted"}.get(name, name)
+        if name not in self.MODES:
+            return f"Mode is {self.mode}. Say `mode autonomous` or `mode assisted`."
+        self.mode = name
+        self._held_for = None
+        self.session_log.write("mode_changed", trigger="operator", action=name)
+        if name == "assisted":
+            return ("Co-pilot: I cue and propose the next track; say `go` to blend. "
+                    "With no answer by the last call I blend anyway.")
+        return "Autonomous: I cue and blend on my own."
+
+    #: The MC's dip: -12 dB, in over a beat, back out over a bar.
+    MC_DUCK: float = 0.25
+    MC_STEPS: int = 8
+
+    def set_mc(self, on: bool) -> str:
+        """Dip the master under the MC, or bring it back. On the next beat."""
+        if on == self.mc:
+            return "The MC already has the mic." if on else "No MC on the mic."
+        self.mc = on
+        self._held_for = None
+        # A new dip supersedes one still ramping; start from where it got to.
+        self.scheduler.cancel(self._mc_token)
+        token = self._mc_token = CancelToken("mc")
+        start, beat = glue.beat_grid(self.engine)
+        span = beat if on else 4.0 * beat
+        cur = float(self.engine._master_gain)
+        to = self.MC_DUCK if on else 1.0
+        for i in range(1, self.MC_STEPS + 1):
+            self.scheduler.submit(SetMasterGain(
+                gain=cur + (to - cur) * i / self.MC_STEPS,
+                execute_at=int(start + span * (i - 1) / (self.MC_STEPS - 1)),
+                origin="mc", token=token,
+            ))
+        self.session_log.write(
+            "mc_on" if on else "mc_off", trigger="operator",
+            action=(f"master to {20 * math.log10(to):+.0f} dB over "
+                    f"{'a beat' if on else 'a bar'}; arming "
+                    f"{'waits for the last call' if on else 'free'}"),
+        )
+        if on:
+            return "Mic's yours: music dipped 12 dB, nothing blends until `mc off` or the last call."
+        return "Music back up over a bar."
+
+    def last_call_seconds(self) -> float:
+        """The latest a held blend can wait: one phrase and the margin."""
+        phrase_s = (self.autopilot_lead_seconds() - AUTOPILOT_MARGIN_SECONDS) / AUTOPILOT_LEAD_PHRASES
+        return phrase_s + AUTOPILOT_MARGIN_SECONDS
+
+    def _arm_held(self, live) -> bool:
+        """Whether arming waits: co-pilot for `go`, or the MC. Until the last call."""
+        why = ("the MC has the mic" if self.mc
+               else "co-pilot: waiting for `go`" if self.mode == "assisted" else None)
+        if why is None or self._cued is None:
+            return False
+        title = self._cued.analysis.title
+        waiting = self._seconds_to_mix_out(live) > self.last_call_seconds()
+        said = (title, "wait" if waiting else "last call")
+        if self._held_for != said:
+            self._held_for = said
+            if waiting:
+                self.session_log.write("arm_held", track=title, trigger=why,
+                                       action="proposed; waiting")
+                self.notify(f"[copilot] next up: {title}. Say `go` to blend, or cue "
+                            "something else." if not self.mc else
+                            f"[mc] holding the blend into {title} while the mic is live")
+            else:
+                self.session_log.write("arm_last_call", track=title, trigger=why,
+                                       action="no answer by the last call; blending")
+                self.notify(f"[autopilot] last call: blending into {title} now")
+        return waiting
+
+    def explain(self) -> str:
+        """Why the set is doing what it is doing, read back from the log.
+
+        Only fields as they were logged when each decision was taken -- never
+        recomputed now, so the answer cannot be a story told after the fact.
+        """
+        wanted = ("track_cued", "transition_armed", "closed_loop", "arm_held",
+                  "run_dry", "track_unplayable", "cue_missing")
+        last: dict[str, dict] = {}
+        try:
+            lines = self.session_log.path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            return f"The session log cannot be read: {exc}"
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("event") in wanted:
+                last[row["event"]] = row
+        if not last:
+            return "Nothing decided yet: the log has no cue, blend or correction."
+        out = []
+        for event in wanted:
+            row = last.get(event)
+            if row is None:
+                continue
+            when = str(row.get("ts", ""))[11:19]
+            did = f" {row['decision_id']}" if row.get("decision_id") else ""
+            head = f"[{when}{did}] {event}"
+            if row.get("track"):
+                head += f" {row['track']}"
+            out.append(f"{head}: {row.get('action')} (because: {row.get('trigger')})")
+            if event == "transition_armed":
+                out.append(f"    rule: {row.get('style_rule')}; placement: "
+                           f"{row.get('plan_reason')}; design: {row.get('design_source')}")
+            snap = row.get("snapshot")
+            if snap:
+                out.append(f"    seen: master {snap.get('master_bpm')} BPM, "
+                           f"peak {snap.get('master_peak')}, blend "
+                           f"{'running' if snap.get('transition_active') else 'idle'}")
+        return "\n".join(out)
+
+    # --- song suggest and cue (Phase 3.2) -------------------------------------
+
+    #: Cue modes. "after" waits for N more tracks first.
+    CUE_MODES: tuple[str, ...] = ("next", "after", "now")
+
+    @property
+    def cue_queue(self) -> list[dict]:
+        return self.set_state.cue_queue
+
+    def suggest(self, n: int = 5) -> list["songs.Suggestion"]:
+        """Top ``n`` next tracks from the playing one, each with its reasons.
+
+        A list that differs from the last one shown is logged with every row's
+        reason terms: which of them the operator then cues, and which they pass
+        over, is what the preference learner reads (djai.feedback.choices).
+        """
+        current = self.analysis_for(self.live_deck)
+        live_bpm = self._playing_bpm()
+        rows = songs.suggest(
+            self.crate, current, self._selectable(), n=n,
+            plan_fit=self.plan_fit,
+            energy_direction=self.energy_direction, set_phase=self._phase_arg(),
+            history=self.history, cache_dir=self.cache_dir,
+            weights=self.selector_weights, playing_bpm=live_bpm or None,
+            travel=self.tempo_target is not None,
+        )
+        ids = tuple(r.track.track_id for r in rows)
+        if ids and ids != self._shown_ids:
+            self._shown_ids = ids
+            self.session_log.write(
+                "suggestions_shown", trigger="suggest", persona=self.persona,
+                action=f"{len(rows)} shown",
+                rows=[{"track_id": r.track.track_id, "rank": r.rank,
+                       "score": round(r.score, 4), "terms": r.terms} for r in rows],
+            )
+        return rows
+
+    def plan_fit(self, track: TrackAnalysis) -> float:
+        """How well a track fits the set plan, 0..1 (0 with no plan)."""
+        return planner.plan_fit(self.set_plan, track, self.crate)
+
+    def replan(self, reason: str) -> "planner.Plan | None":
+        """Re-make the set plan from where the set is now. Control thread.
+
+        Soft by design: called after every cue, on every change to the cue
+        queue, and when the set goes off the plan. Only its first slot is ever
+        acted on. Logged with its critic score and its three horizons.
+        """
+        if self.set_plan is None and reason != "planned":
+            return None
+        persona = planner.PERSONAS.get(self.persona, planner.PERSONAS["default"])
+        current = self.analysis_for(self.live_deck) if self.history else None
+        elapsed = self.engine.frames_played / SAMPLE_RATE / 60.0
+        plan = planner.plan_set(
+            self.crate, current, list(self.history), list(self.cue_queue), persona,
+            elapsed_min=elapsed, minutes=self.set_minutes,
+            playing_bpm=self._playing_bpm() or None, excluded=self._unplayable,
+            weights=self.selector_weights, cache_dir=self.cache_dir,
+        )
+        plan.reason = reason
+        self.set_plan = plan
+        self.set_state.plan = plan.as_dict()
+        self.set_state.persona = self.persona
+        self.set_state.save()
+        c = plan.critique
+        self.session_log.write(
+            "set_plan", trigger=reason,
+            action=(f"{len(plan.slots)} tracks over {plan.minutes:.0f} min, "
+                    f"critic {c['score']:.1f}/10"),
+            persona=self.persona, critic=c,
+            near=[s.track.title for s in plan.near],
+            mid=[s.track.title for s in plan.mid],
+            full=[s.track.title for s in plan.slots],
+            slots=[s.as_dict() for s in plan.slots],
+        )
+        self._ask_plan_note(plan)
+        return plan
+
+    def _ask_plan_note(self, plan: "planner.Plan") -> None:
+        """An advisory LLM note on the plan, on its own thread. Never waited on.
+
+        The rules-based critic's score is the one that is logged and used;
+        the model only adds a sentence. With no model, nothing happens.
+        """
+        engine = self.intent_engine
+        if engine is None or not getattr(engine, "available", False) \
+                or not hasattr(engine, "critique_plan"):
+            return
+        summary = plan.summary()
+
+        def work() -> None:
+            note, why = engine.critique_plan(summary)
+            self.session_log.write(
+                "set_plan_note", trigger="llm narrative critic",
+                action=(note or {}).get("note", "") if note else f"none ({why})",
+                llm_score=(note or {}).get("score"),
+            )
+
+        threading.Thread(target=work, name="djai-plan-note", daemon=True).start()
+
+    def set_persona(self, name: str) -> str:
+        if name not in planner.PERSONAS:
+            return f"Personas: {', '.join(planner.PERSONAS)}."
+        self.persona = name
+        self.set_state.persona = name
+        self.set_state.save()
+        # Preferences are learned per persona: the weights change with it.
+        self.reload_feedback()
+        self.replan(f"persona {name}")
+        return f"Persona: {name}."
+
+    def _cap_path(self, track: TrackAnalysis, from_bpm: float | None = None):
+        """How the playing tempo meets ``track`` inside the stretch cap."""
+        bpm = from_bpm if from_bpm else self._playing_bpm()
+        if not bpm:
+            return selector_mod.TempoPath("direct")
+        return selector_mod.tempo_path(bpm, track.bpm, travel=True)
+
+    def cue_song(self, query: str, mode: str = "next", after: int = 0) -> str:
+        """Find a track by name and queue it. Never guesses, never drops.
+
+        Deterministic: the lookup is djai.songs.lookup. Several close matches
+        are returned to the operator and nothing is queued; no match says so.
+        """
+        mode = mode if mode in self.CUE_MODES else "next"
+        found = songs.lookup(self.crate, query)
+        if found.status == "none":
+            self.session_log.write("cue_lookup", trigger=query, action="no match")
+            return f"No track matches {query!r}. Nothing was queued."
+        if found.status == "ambiguous":
+            self.session_log.write(
+                "cue_lookup", trigger=query, action="ambiguous",
+                candidates=[t.title for t in found.tracks],
+            )
+            lines = "\n".join(f"  - {t.title}" for t in found.tracks)
+            return (f"{query!r} matches more than one track:\n{lines}\n"
+                    "Say `cue <title>` with the one you mean.")
+        return self.cue_track(found.track, mode, after, query=query)
+
+    def cue_track(self, track: TrackAnalysis, mode: str = "next", after: int = 0,
+                  query: str = "") -> str:
+        """Queue a known track. The one entry point for every surface."""
+        reason = self._set_aside(track)
+        if reason is not None:
+            return f"Cannot cue {track.title}: {reason}. Re-analyse it first."
+        warning = None
+        if getattr(track, "quarantined", False):
+            warning = (f"low grid confidence ({track.grid_confidence:.2f}): it will "
+                       "come in on an echo out, not a long blend")
+        entry = self.set_state.add_cue({
+            "track_id": track.track_id, "title": track.title, "mode": mode,
+            "after": max(0, int(after)) if mode == "after" else 0,
+            "status": "queued", "bridge": None, "warning": warning,
+            "added_at": time.time(),
+        }, front=(mode == "now"))
+        self.session_log.write(
+            "cue_added", track=track.title, trigger=f"operator: {query or track.title}",
+            action=f"queued ({mode}{' ' + str(entry['after']) if mode == 'after' else ''})",
+            cue_id=entry["id"], warning=warning, track_id=track.track_id,
+            persona=self.persona,
+            from_suggestion=(self._shown_ids.index(track.track_id) + 1
+                             if track.track_id in self._shown_ids else None),
+        )
+        reply = f"Queued {track.title} ({self._mode_text(entry)})."
+        bridge = self._check_bridge(entry)
+        if bridge:
+            reply += " " + bridge
+        if warning:
+            reply += f" Warning: {warning}."
+        self.replan("cue added")
+        if mode == "now" and entry["status"] == "queued":
+            reply += " " + self._play_now_entry(entry)
+        return reply
+
+    @staticmethod
+    def _mode_text(entry: dict) -> str:
+        if entry["mode"] == "after":
+            return f"after {entry['after']} more track(s)"
+        return {"next": "plays next", "now": "plays now"}[entry["mode"]]
+
+    def _check_bridge(self, entry: dict) -> str:
+        """Mark a cue the stretch cap cannot reach, and ask. '' if it can."""
+        track = self._track_by_id(entry["track_id"])
+        if track is None or entry.get("bridge"):
+            return ""
+        path = self._cap_path(track)
+        if path.blendable:
+            entry["status"] = "queued"
+            self.set_state.save()
+            return ""
+        entry["status"] = "needs_bridge"
+        self.set_state.save()
+        msg = (f"{track.title} ({track.bpm:.1f} BPM) is beyond the "
+               f"+-{config.MAX_STRETCH_RATIO:.0%} stretch cap from {self._playing_bpm():.1f} "
+               "BPM, even half or double time. Choose: `bridge tempo` (echo out, it "
+               "comes in at its own tempo) or `bridge track` (a bridge track first). "
+               "It stays queued until you choose.")
+        self.session_log.write("cue_needs_bridge", track=track.title,
+                               trigger="stretch cap", action="asked the operator",
+                               cue_id=entry["id"])
+        self.notify(f"[cue] {msg}")
+        return msg
+
+    def _track_by_id(self, track_id: str) -> TrackAnalysis | None:
+        return next((t for t in self.crate if t.track_id == track_id), None)
+
+    def resolve_bridge(self, choice: str) -> str:
+        """Answer the bridge question for the first cue waiting on one."""
+        entry = next((e for e in self.cue_queue if e["status"] == "needs_bridge"), None)
+        if entry is None:
+            return "No cue is waiting on a bridge."
+        track = self._track_by_id(entry["track_id"])
+        if choice == "tempo":
+            entry.update(status="queued", bridge="tempo")
+            self.set_state.save()
+            self.session_log.write("cue_bridge", track=entry["title"], trigger="operator",
+                                   action="tempo bridge (echo out at its own tempo)")
+            return f"{entry['title']} will come in on a tempo bridge."
+        if choice == "track":
+            bridge = self._bridge_track(track) if track else None
+            if bridge is None:
+                return ("No track in the crate bridges that gap inside the cap. "
+                        "Say `bridge tempo` instead.")
+            entry.update(status="queued", bridge="track")
+            i = self.cue_queue.index(entry)
+            self.cue_queue.insert(i, {
+                "id": self.set_state.next_cue_id, "track_id": bridge.track_id,
+                "title": bridge.title, "mode": "next", "after": 0, "status": "queued",
+                "bridge": None, "warning": None, "added_at": time.time(),
+                "bridge_for": entry["id"],
+            })
+            self.set_state.next_cue_id += 1
+            self.set_state.save()
+            self.session_log.write("cue_bridge", track=entry["title"], trigger="operator",
+                                   action=f"bridge track {bridge.title} inserted before it")
+            self.replan("bridge track inserted")
+            return f"{bridge.title} ({bridge.bpm:.1f} BPM) goes first, then {entry['title']}."
+        return "Say `bridge tempo` or `bridge track`."
+
+    def _bridge_track(self, target: TrackAnalysis) -> TrackAnalysis | None:
+        """The best-ranked track reachable now from which ``target`` is reachable."""
+        current = self.analysis_for(self.live_deck)
+        queued = {e["track_id"] for e in self.cue_queue}
+        for c in rank_candidates(
+            self.crate, current, self._selectable() | queued, self.energy_direction,
+            history=self.history, cache_dir=self.cache_dir,
+            weights=self.selector_weights, playing_bpm=self._playing_bpm() or None,
+            travel=True,
+        ):
+            played_at = c.track.bpm * (c.tempo_path.rate_b or 1.0)
+            if self._cap_path(target, from_bpm=played_at).blendable:
+                return c.track
+        return None
+
+    def queue_text(self) -> str:
+        if not self.cue_queue:
+            return "The cue queue is empty."
+        rows = []
+        for i, e in enumerate(self.cue_queue, start=1):
+            flag = " [NEEDS BRIDGE]" if e["status"] == "needs_bridge" else ""
+            warn = f" [warning: {e['warning']}]" if e.get("warning") else ""
+            rows.append(f"{i}. {e['title']} - {self._mode_text(e)}{flag}{warn}")
+        return "\n".join(rows)
+
+    def queue_remove(self, index: int) -> str:
+        if not 1 <= index <= len(self.cue_queue):
+            return f"No cue {index}; the queue has {len(self.cue_queue)}."
+        entry = self.cue_queue.pop(index - 1)
+        self.set_state.save()
+        self.session_log.write("cue_removed", track=entry["title"], trigger="operator",
+                               action=f"removed from position {index}")
+        self.replan("cue removed")
+        return f"Removed {entry['title']}."
+
+    def queue_move(self, index: int, to: int) -> str:
+        n = len(self.cue_queue)
+        if not (1 <= index <= n and 1 <= to <= n):
+            return f"Positions run 1 to {n}."
+        entry = self.cue_queue.pop(index - 1)
+        self.cue_queue.insert(to - 1, entry)
+        self.set_state.save()
+        self.session_log.write("cue_moved", track=entry["title"], trigger="operator",
+                               action=f"moved {index} -> {to}")
+        self.replan("cue moved")
+        return f"Moved {entry['title']} to {to}."
+
+    def _due_cue(self) -> dict | None:
+        """The cue to play next, or None to let the selector choose.
+
+        Queue order is never changed: an "after N" entry still waiting lets
+        the entries behind it through, but one waiting on the operator's
+        bridge choice holds everything behind it, and the selector fills the
+        gap meanwhile rather than letting the room go quiet.
+        """
+        for entry in self.cue_queue:
+            if entry["status"] == "needs_bridge":
+                return None
+            if entry["mode"] == "after" and entry["after"] > 0:
+                continue
+            return entry
+        return None
+
+    def _count_cue(self, cued_id: str) -> None:
+        """A track was cued: every "after N" cue waits one track less."""
+        changed = False
+        for e in self.cue_queue:
+            if e["mode"] == "after" and e["after"] > 0 and e["track_id"] != cued_id:
+                e["after"] -= 1
+                changed = True
+        self.set_state.history.append(cued_id)
+        if changed or self.set_state.path is not None:
+            self.set_state.save()
+
+    def _play_now_entry(self, entry: dict) -> str:
+        """Bring a "now" cue in at the next 4-bar point, through the Short band."""
+        self._complete_handover()
+        if self.engine.transition_active:
+            entry["mode"] = "next"
+            self.set_state.save()
+            return "A transition is running; it plays straight after."
+        self.abort_armed_transition()
+        if self.has_cued_track() and (self._cued is None or
+                                      self._cued.analysis.track_id != entry["track_id"]):
+            self._cued = None
+            self.engine.deck(self.cued_deck()).set_gain(0.0)
+        if not self.has_cued_track() and not self.cue_next(origin="play now"):
+            return "It could not be cued; it stays at the head of the queue."
+        self._play_now = entry["track_id"]
+        return "It comes in at the next 4-bar line."
+
+    #: Play now lands on the next line of this many bars.
+    PLAY_NOW_BARS: int = 4
+
+    def _arm_play_now(self, live) -> None:
+        track_id, self._play_now = self._play_now, None
+        if self._cued is None or self._cued.analysis.track_id != track_id:
+            return
+        # origin "user": the supervisor's 40% placement floor exists to catch
+        # automatic placement regressing, and exempts a human asking to go now.
+        execute_at = self.arm_transition(origin="user", at_bars=self.PLAY_NOW_BARS)
+        if execute_at is None:
+            self.notify("[cue] play now could not be armed; it plays next instead")
+            return
+        # A filter swell on the outgoing deck over the beat before the line
+        # masks the change of direction (SPEC §1 glue). It lands back on the
+        # detent before the transition's own filter columns take over.
+        beat = SAMPLE_RATE * 60.0 / max(self.engine.master_bpm or 120.0, 1.0)
+        start = int(execute_at - 4 * beat)
+        if start > self.engine.frames_played:
+            for cmd in glue.filter_swell(self.live_deck, start, beat, beats=4.0,
+                                         peak=0.45, origin="play now"):
+                self.scheduler.submit(cmd)
+        bars = self.bars_until(execute_at)
+        self.session_log.write("play_now", track=self._cued.title, trigger="operator",
+                               action=f"armed {bars:.1f} bars out, filter swell glue")
+        self.notify(f"[cue] {self._cued.title} in {bars:.0f} bars")
+
     def force_transition(self) -> str:
         """Blend now, on the next phrase boundary. The 'go' button."""
+        self._complete_handover()
         if self.engine.transition_active:
             return "A transition is already running."
         if not self.has_cued_track():
@@ -508,6 +1170,228 @@ class Session:
         )
         return f"Blending into {title} in {bars:.0f} bars."
 
+    #: "Harder" and "calmer" on the live deck, at full strength: high-band and
+    #: mid-band gain for harder (+3.5 dB / +1.2 dB), high-band gain and a
+    #: low-pass knob position for calmer. Absolute targets from neutral, so a
+    #: repeated request does not stack.
+    ENERGY_HIGH_LIFT: float = 0.5
+    ENERGY_MID_LIFT: float = 0.15
+    ENERGY_HIGH_CUT: float = 0.3
+    ENERGY_LOWPASS: float = 0.35
+    #: The move starts on the next beat and ramps in over this many bars, in
+    #: this many steps: the Short band, audible long before the next track.
+    ENERGY_RAMP_BARS: float = 2.0
+    ENERGY_RAMP_STEPS: int = 4
+
+    def energy_correction(
+        self, direction: float, lead_bars: float = 0.0, origin: str = "operator",
+    ) -> str | None:
+        """Answer "harder" / "calmer" on the deck playing now, within bars.
+
+        Re-cueing the next track is the long answer, and it can be a phrase
+        or more away. This is the immediate one: a tempo-relative EQ and
+        filter trajectory on the live deck. It lasts until the hand-over,
+        which returns both decks to neutral. Inside a running blend the
+        envelope owns these controls, and the incoming track *is* the
+        change, so nothing is scheduled.
+        """
+        d = max(-1.0, min(1.0, float(direction)))
+        # The closed loop may ask for neutral (0) to take a correction back;
+        # an operator's "a little harder" of nothing is not a request.
+        if (abs(d) < 0.05 and origin == "operator") or self.engine.transition_active:
+            return None
+        name = self.live_deck
+        deck = self.engine.deck(name)
+        if deck.track is None:
+            return None
+        if origin == "operator" and self.room is not None:
+            self.room.operator(d)
+        self.scheduler.cancel(self._energy_token)
+        self._energy_token = token = CancelToken("energy")
+        if d > 0:
+            high, mid, pos = 1.0 + self.ENERGY_HIGH_LIFT * d, 1.0 + self.ENERGY_MID_LIFT * d, 0.0
+        else:
+            high, mid, pos = 1.0 - self.ENERGY_HIGH_CUT * -d, 1.0, -self.ENERGY_LOWPASS * -d
+        h0, m0, p0 = deck.eq_high.target, deck.eq_mid.target, deck.filter_pos.target
+        l0 = deck.eq_low.target
+        low = None
+        if origin != "operator":
+            # The closed loop's correction is the same shape plus a level
+            # trim across all three bands: a pushed fader wants trimming, not
+            # a low-pass that dulls the record. It owns the low band too, so
+            # putting drifted controls back covers a boosted or killed bass.
+            trim = 10.0 ** (self.ROOM_TRIM_DB * d / 20.0)
+            # Inside the supervisor's 0..2 band range, or the step is refused.
+            low, mid, high = (round(min(2.0, v), 4) for v in (trim, mid * trim, high * trim))
+        start, beat = glue.beat_grid(self.engine)
+        if lead_bars > 0:
+            # The Short band: on the next 4-bar line at least `lead_bars` out,
+            # so the move lands on the music's own boundaries.
+            ta = deck.track.analysis
+            bar = phrase.bar_at_frame(ta, deck.position)
+            line = (math.floor((bar + lead_bars) / 4.0) + 1) * 4
+            start = phrase.deck_frame_to_engine_frame(
+                deck, self.engine.frames_played, phrase.frame_at_bar(ta, line))
+        steps = max(1, self.ENERGY_RAMP_STEPS)
+        span = self.ENERGY_RAMP_BARS * 4 * beat
+        if origin != "operator" and any(
+            isinstance(c, StartTransition) and c.execute_at <= start + span + 4 * beat
+            for c in self.scheduler.pending()
+        ):
+            # The loop's ramp would still be moving when an armed blend takes
+            # the decks over. The blend is the bigger change; leave it be.
+            return None
+        queued = 0
+        tag = "energy" if origin == "operator" else origin
+        for i in range(steps):
+            f = (i + 1) / steps
+            at = int(round(start + span * i / steps))
+            for cmd in (
+                SetEQ(deck=name, mid=round(m0 + (mid - m0) * f, 4),
+                      high=round(h0 + (high - h0) * f, 4),
+                      low=None if low is None else round(l0 + (low - l0) * f, 4),
+                      execute_at=at, origin=tag, token=token),
+                SetFilter(deck=name, position=round(p0 + (pos - p0) * f, 4),
+                          execute_at=at, origin=tag, token=token),
+            ):
+                if self.supervisor.validate(cmd) is None:
+                    self.scheduler.submit(cmd)
+                    queued += 1
+        if self.room is not None:
+            self.room.controls = (l0 if low is None else low, mid, high, pos)
+        way = "harder" if d > 0 else ("calmer" if d < 0 else "neutral")
+        self.session_log.write(
+            "energy_correction",
+            deck=name,
+            trigger=f"{origin}: {way} ({d:+.2f})",
+            action=(
+                f"high x{high:.2f}, mid x{mid:.2f}, filter {pos:+.2f} over "
+                f"{self.ENERGY_RAMP_BARS:g} bars from "
+                + (f"the next 4-bar line {lead_bars:g}+ bars out" if lead_bars > 0
+                   else "the next beat")
+                + f"; {queued} command(s)"
+            ),
+        )
+        return f"Pushing deck {name} {way} now."
+
+    #: The closed loop's level trim at full correction, in dB either way.
+    ROOM_TRIM_DB: float = 3.0
+    #: A room_reading line every this many bars (about 15 s at 128 BPM).
+    ROOM_LOG_BARS: int = 8
+    #: The closed loop's corrections start on a 4-bar line at least this many
+    #: bars out: past the Immediate band, inside the Short one.
+    ROOM_LEAD_BARS: float = 2.0
+
+    def _room_tick(self) -> None:
+        """Measure the bars the room heard since the last tick, and answer a
+        drop or a spike the playing track does not explain. Autopilot thread.
+
+        Paused through a blend (the blend *is* the change), while the operator
+        holds manual control, and while frozen: the loop never fights a
+        person. Each correction goes through :meth:`energy_correction` in the
+        Short band, and is a logged decision with its snapshot.
+        """
+        monitor = self.room
+        if monitor is None:
+            return
+        paused = (self.engine.transition_active or self.manual_held or self.frozen
+                  or self.mc)
+        for reading, verdict in monitor.poll(self.live_deck, paused):
+            self._room_bars += 1
+            if self._room_bars >= self.ROOM_LOG_BARS:
+                self._room_bars = 0
+                self.session_log.write(
+                    "room_reading", trigger="closed loop", action="measured",
+                    bar=reading.bar, **monitor.state(),
+                )
+            if verdict is not None and verdict.direction is not None and monitor.operator_owns:
+                if not self._room_deferred:
+                    self._room_deferred = True
+                    self.session_log.write(
+                        "closed_loop_deferred", trigger=verdict.reason,
+                        action="the operator has the EQ and filter; watching only",
+                        bar=verdict.bar, deviation_db=round(verdict.deviation_db, 2),
+                    )
+                continue
+            if verdict is None or verdict.direction is None:
+                saturated = verdict is not None and verdict.status == "saturated"
+                if saturated and not self._room_saturated:
+                    self.session_log.write(
+                        "closed_loop_saturated", trigger="closed loop",
+                        action=verdict.reason, bar=verdict.bar,
+                        deviation_db=round(verdict.deviation_db, 2),
+                    )
+                if verdict is not None:
+                    self._room_saturated = saturated
+                continue
+            self._room_saturated = False
+            reply = self.energy_correction(
+                verdict.direction, lead_bars=self.ROOM_LEAD_BARS, origin="closed loop")
+            self.session_log.decision(
+                "closed_loop", self.engine.features.latest(),
+                action=(f"correction level {verdict.direction:+.2f}"
+                        + ("" if reply else " (nothing scheduled)")),
+                trigger=verdict.reason, status=verdict.status, bar=verdict.bar,
+                deviation_db=round(verdict.deviation_db, 2),
+                direction=verdict.direction, heuristic=True,
+                proxies=monitor.master.summary(),
+            )
+
+    def operator_touched(self, deck_name: str) -> None:
+        """A hand on a deck's EQ or filter. Any control thread.
+
+        On the live deck, those knobs are the operator's until the next
+        hand-over: the closed loop keeps measuring and never writes them.
+        """
+        if self.room is not None and deck_name == self.live_deck:
+            self.room.operator_touched()
+
+    def cancel_transition(self, fade_beats: float = 1.0) -> str:
+        """Back out of the blend in flight, or drop one armed but not started.
+
+        A running blend is reverted in the engine over ``fade_beats``: the
+        incoming deck fades out and stops and the outgoing one returns to
+        unity. Anything still queued for the incoming deck (a stem swap, a
+        loop) goes too, or it would fire into a deck that is no longer coming
+        in. Clearing ``_transition_armed`` is what stops the autopilot reading
+        the stopped deck as a finished hand-over.
+        """
+        if not self.engine.transition_active:
+            dropped = self.abort_armed_transition()
+            return (
+                f"Dropped the armed transition ({dropped} command(s))."
+                if dropped else "No transition to cancel."
+            )
+        incoming = self.cued_deck()
+        dropped = self.scheduler.cancel_matching(
+            lambda c: getattr(c, "deck", None) == incoming
+            or isinstance(c, (StartTransition, SwapStems))
+        )
+        fade = int(round(
+            fade_beats * SAMPLE_RATE * 60.0 / (self.engine.master_bpm or 120.0)
+        ))
+        self.engine.submit(CancelTransition(fade_frames=fade, origin="operator"))
+        self._transition_armed = False
+        self._cued = None
+        self.hold_extra_bars = 0
+        if self._cue_decision is not None:
+            self.session_log.outcome(
+                self._cue_decision,
+                self.engine.features.latest(),
+                trigger="transition cancelled",
+                action=f"deck {incoming} faded out over {fade_beats:g} beat(s)",
+            )
+            self._cue_decision = None
+        self.session_log.write(
+            "transition_cancelled",
+            trigger="operator cancel",
+            action=(
+                f"deck {incoming} fades out over {fade_beats:g} beat(s); "
+                f"{len(dropped)} queued command(s) withdrawn"
+            ),
+        )
+        return f"Cancelled: back to deck {self.live_deck}, deck {incoming} fading out."
+
     def set_cue(self, deck_name: str | None) -> str:
         """Route a deck to the pre-listen output."""
         if self.engine.cue_mode == "none":
@@ -522,6 +1406,27 @@ class Session:
             return "Cue off."
         title = self.engine.deck_state(deck_name).title or "nothing loaded"
         return f"Cue: deck {deck_name} ({title}) on {self.engine.cue_mode}."
+
+    def set_master_tempo_lock(self, on: bool) -> str:
+        """Hold the beat clock still, or let it follow each track's own tempo.
+
+        Off by default. On, the set runs at a fixed tempo and every track is
+        matched back to it -- which is what the tempo glide exists to end, so
+        this is an operator's deliberate choice and never a default.
+        """
+        self.master_tempo_locked = bool(on)
+        if not on:
+            return (
+                f"Master BPM unlocked: the clock will glide to each track's "
+                f"own tempo over {config.MASTER_GLIDE_BARS} bars."
+            )
+        # Locking mid-glide would leave the steps in flight to finish the move
+        # the operator just asked to stop.
+        self._drop_unlanded_ride()
+        return (
+            f"Master BPM locked at {self.engine.master_bpm:.1f}. Every track "
+            f"will be matched to it, within +-{config.MAX_STRETCH_RATIO:.0%}."
+        )
 
     def set_key_lock(self, deck_name: str, on: bool) -> str:
         """Key lock for one deck: original pitch at any tempo, or resampling."""
@@ -568,6 +1473,7 @@ class Session:
         self.session_log.write(
             "filter", trigger="manual override", action=f"deck {deck_name} {detail}"
         )
+        self.operator_touched(deck_name)
         if abs(position) <= FILTER_DETENT:
             return f"Deck {deck_name.upper()} filter off."
         kind = "low-pass" if position < 0 else "high-pass"
@@ -620,6 +1526,7 @@ class Session:
         if not self.frozen:
             self.freeze(True)
         self.manual_held = True
+        self.operator_touched(deck_name)
         self.session_log.write(
             "manual_control", deck=deck_name, trigger=action, action=detail,
             quantized=self.quantize,
@@ -881,6 +1788,279 @@ class Session:
         track = self.engine.deck(deck_name).track
         return track.analysis if track else None
 
+    def _playing_bpm(self) -> float:
+        """The tempo the mix is actually running at, ridden and stretched."""
+        playing = self.engine.master_bpm
+        if playing > 0:
+            return playing
+        live = self.engine.deck(self.live_deck)
+        if live.track is None:
+            return 0.0
+        return live.track.analysis.bpm * max(live.rate, 1e-6)
+
+    def tempo_path_to(self, incoming: TrackAnalysis) -> Any:
+        """How the mix gets from what is playing to this track.
+
+        Measured against the master clock rather than the playing track's
+        printed tempo, so a deck that has already been ridden is where the
+        next path starts from.
+        """
+        playing = self._playing_bpm()
+        return selector_tempo_path(playing, incoming.bpm, travel=self._travelling(incoming))
+
+    def _travelling(self, incoming: TrackAnalysis) -> bool:
+        """Is this hand-over meant to move the set's tempo, or hold it?
+
+        Only when a target is set and the set has not arrived. A travelling
+        path lets the new track keep its own tempo and rides the playing deck
+        to meet it; holding does the opposite, which is what a set with no
+        destination wants. The condition is deliberately the same one
+        :meth:`cue_next` plans under, so the path the candidate was chosen
+        with is the path the transition is armed with.
+        """
+        if self.tempo_target is None:
+            return False
+        playing = self.engine.master_bpm
+        if playing <= 0:
+            return False
+        return abs(playing - self.tempo_target) >= 0.5
+
+    def _schedule_tempo_ride(self, path: Any) -> None:
+        """Walk the playing deck toward the incoming tempo, a step per bar line.
+
+        Scheduled commands on the control thread -- the same pitch fader an
+        operator has, moved in small steps over `path.bars` bars. Nothing in
+        the audio callback changes, and the ride is over before the transition
+        it was planned for begins.
+        """
+        live = self.engine.deck(self.live_deck)
+        if live.track is None or not path.ride_percent:
+            return
+        analysis = live.track.analysis
+        # A ride still moving when the blend starts would pitch this deck while
+        # the incoming one is held at the rate it was armed with: the two would
+        # walk apart mid-transition. So it is cut to fit the time left before
+        # mix-out, with a phrase to spare, and skipped when there is no room.
+        seconds = self._seconds_to_mix_out(live)
+        # Measured at the fastest this deck will be running, not the slowest:
+        # a ride that speeds it up brings its mix-out forward, and an estimate
+        # made at today's rate leaves the last steps stranded past the blend.
+        playing_bpm = analysis.bpm * max(live.rate, 1e-6)
+        ridden_bpm = playing_bpm * (1.0 + max(path.ride_percent, 0.0))
+        room_bars = seconds * playing_bpm / 60.0 / 4.0 * (
+            playing_bpm / ridden_bpm
+        ) - RIDE_MARGIN_BARS
+        bars = min(float(path.bars), room_bars)
+        if bars < 2.0:
+            self.session_log.write(
+                "tempo_ride",
+                deck=self.live_deck,
+                track=analysis.title,
+                trigger=path.describe(),
+                action=(
+                    f"not ridden: only {max(room_bars, 0.0):.1f} bar(s) before "
+                    "mix-out, the deck stays where it is"
+                ),
+            )
+            return
+        start_bar = math.floor(phrase.bar_at_frame(analysis, live.position)) + 1
+        steps = max(2, min(8, int(bars // 2) or 2))
+        base = float(live.rate)
+        queued = 0
+        for i in range(1, steps + 1):
+            bar = start_bar + bars * i / steps
+            frame = phrase.frame_at_bar(analysis, bar)
+            cmd = SetPitch(
+                deck=self.live_deck,
+                rate=round(base * (1.0 + path.ride_percent * i / steps), 6),
+                execute_at=phrase.deck_frame_to_engine_frame(
+                    live, self.engine.frames_played, frame
+                ),
+                origin="tempo_ride",
+                token=self._ride_token,
+            )
+            if self.supervisor.validate(cmd) is None:
+                self.scheduler.submit(cmd)
+                self._ride_steps.append((cmd.execute_at, cmd.rate))
+                queued += 1
+        self._ride_deck = self.live_deck
+        self.session_log.write(
+            "tempo_ride",
+            deck=self.live_deck,
+            track=analysis.title,
+            trigger=f"{path.describe()}",
+            action=(
+                f"{queued} pitch step(s) over {bars:.0f} bars to "
+                f"{base * (1.0 + path.ride_percent):.4f}x"
+            ),
+        )
+
+    def _schedule_master_glide(self, deck_name: str) -> None:
+        """Glide the beat clock to the deck's own BPM after a hand-over.
+
+        The tempo lock this ends, in one line of arithmetic: an incoming track
+        is matched to master before the blend, so its rate is
+        ``master / native``; :meth:`Engine.hand_master_to` then adopts
+        ``native * rate`` -- which is ``master`` again. The hand-over cannot
+        move the clock, so without this the set stays at whatever tempo it
+        opened at and every later track is stretched back to it for the night.
+
+        So the glide walks the deck that is now the mix from the rate it was
+        matched at back to 1.0 -- its own tempo -- one pitch step per bar line
+        over :data:`config.MASTER_GLIDE_BARS`. The engine moves the clock with
+        the master deck's fader, so the clock arrives with it, and the last
+        step puts the deck back on its unstretched source.
+
+        Scheduled commands on the control thread, like :meth:`_schedule_tempo_ride`
+        it borrows from. Nothing in the audio callback changes.
+        """
+        if self.master_tempo_locked:
+            return
+        deck = self.engine.deck(deck_name)
+        if deck.track is None:
+            return
+        analysis = deck.track.analysis
+        base = float(deck.rate)
+        if abs(base - 1.0) < config.STRETCH_DEADBAND:
+            return  # already at its own tempo: nothing to glide
+        # A glide still in flight is superseded, never interleaved with this one.
+        stale = self.scheduler.cancel_matching(
+            lambda cmd: getattr(cmd, "origin", "") == "master_glide"
+        )
+        if stale:
+            gone = {(c.execute_at, c.rate) for c in stale}
+            self._ride_steps = [s for s in self._ride_steps if s not in gone]
+        bars = float(max(1, config.MASTER_GLIDE_BARS))
+        # One step per bar, capped so a long glide does not flood the scheduler.
+        steps = max(2, min(16, int(bars)))
+        start_bar = math.floor(phrase.bar_at_frame(analysis, deck.position)) + 1
+        queued = 0
+        for i in range(1, steps + 1):
+            # Linear in rate, so each step is the same size: a glide that
+            # accelerates is a glide the room can hear.
+            rate = base + (1.0 - base) * i / steps
+            if i == steps:
+                rate = 1.0  # land exactly, so the source swap triggers
+            frame = phrase.frame_at_bar(analysis, start_bar + bars * i / steps)
+            cmd = SetPitch(
+                deck=deck_name,
+                rate=round(rate, 6),
+                execute_at=phrase.deck_frame_to_engine_frame(
+                    deck, self.engine.frames_played, frame
+                ),
+                origin="master_glide",
+                token=self._ride_token,
+            )
+            if self.supervisor.validate(cmd) is None:
+                self.scheduler.submit(cmd)
+                self._ride_steps.append((cmd.execute_at, cmd.rate))
+                queued += 1
+        if not queued:
+            return
+        self._ride_deck = deck_name
+        self.session_log.write(
+            "master_glide",
+            deck=deck_name,
+            track=analysis.title,
+            from_bpm=round(analysis.bpm * base, 2),
+            to_bpm=round(analysis.bpm, 2),
+            trigger="transition finished",
+            action=(
+                f"{queued} step(s) over {bars:.0f} bars from {base:.4f}x to "
+                f"1.0000x; beat clock follows to {analysis.bpm:.1f} BPM"
+            ),
+        )
+
+    def _follow_ride(self) -> None:
+        """Move the beat clock along with a ride that has landed a step.
+
+        The clock counts the master deck. A ride pitches that deck up without
+        telling it, so the clock would fall behind the pulse it is supposed to
+        be counting -- and the supervisor, seeing the deck run ahead of the
+        clock, would spend the ride correcting it back down. Following each
+        landed step keeps the two on the same side.
+
+        Control thread, from the autopilot tick: two float writes and a pair of
+        dropped baselines, the same work a grid correction already does.
+        """
+        if not self._ride_steps:
+            return
+        now = self.engine.frames_played
+        landed: tuple[int, float] | None = None
+        while self._ride_steps and self._ride_steps[0][0] <= now:
+            landed = self._ride_steps.pop(0)
+        if landed is None or self.engine.master_deck != self._ride_deck:
+            return
+        before = self.engine.master_bpm
+        after = self.engine.hand_master_to(self._ride_deck, rate=landed[1])
+        if abs(after - before) < 1e-6:
+            return
+        for name in ("a", "b"):
+            self.supervisor.forget_baseline(name)
+        self.session_log.write(
+            "tempo_ride_step",
+            deck=self._ride_deck,
+            from_bpm=round(before, 2),
+            to_bpm=round(after, 2),
+            trigger="ride step landed",
+            action=f"beat clock now {after:.1f} BPM",
+        )
+
+    def _drop_unlanded_ride(self) -> None:
+        """Forget a ride once the deck it was riding is no longer the mix.
+
+        Its remaining steps would pitch a deck that has stopped, and -- worse --
+        :meth:`_follow_ride` would read them as tempo the clock should follow.
+        """
+        if not self._ride_steps:
+            return
+        # By token, not by origin: a master glide's steps are ride steps too,
+        # and matching "tempo_ride" alone once left a glide running after the
+        # operator locked the clock.
+        self.scheduler.cancel(self._ride_token)
+        self._ride_token = CancelToken("tempo")
+        self._ride_steps.clear()
+
+    def _planned_master_bpm(self) -> float:
+        """Where the beat clock will be once a ride in flight has landed."""
+        master = self.engine.master_bpm
+        if not self._ride_steps or self.engine.master_deck != self._ride_deck:
+            return master
+        deck = self.engine.deck(self._ride_deck)
+        if deck.track is None:
+            return master
+        return deck.track.analysis.bpm * self._ride_steps[-1][1]
+
+    def _drop_late_ride_steps(self, blend_starts_at: int) -> None:
+        """Cancel ride steps that would still be moving during the blend.
+
+        The ride is planned to be over well before this -- see
+        :data:`RIDE_MARGIN_BARS` -- so this is a fence, not a mechanism. If it
+        ever fires it is worth reading about, because the transition was
+        matched to a tempo the deck was not going to reach in time, and the
+        supervisor has to take up the difference.
+        """
+        if not self._ride_steps:
+            return
+        late = [step for step in self._ride_steps if step[0] >= blend_starts_at]
+        if not late:
+            return
+        cutoff = min(step[0] for step in late)
+        dropped = self.scheduler.cancel_matching(
+            lambda cmd: getattr(cmd, "origin", "") == "tempo_ride"
+            and getattr(cmd, "execute_at", 0) >= cutoff
+        )
+        self._ride_steps = [s for s in self._ride_steps if s[0] < blend_starts_at]
+        self.session_log.write(
+            "tempo_ride",
+            deck=self._ride_deck,
+            trigger="ride would still be moving when the blend starts",
+            action=(
+                f"{len(dropped)} step(s) dropped; the supervisor closes what "
+                "is left"
+            ),
+        )
+
     def _beyond_stretch_range(self, incoming: TrackAnalysis) -> bool:
         """Is this track too far from the live tempo for any blend?
 
@@ -897,22 +2077,103 @@ class Session:
         return abs(incoming.bpm - effective) / effective > config.MAX_STRETCH_RATIO
 
     def _rate_for(self, candidate: TrackAnalysis) -> float:
-        """Resampling rate that puts ``candidate`` at the master tempo."""
+        """Resampling rate that puts ``candidate`` at the master tempo.
+
+        Never further from 1.0 than :data:`config.MAX_STRETCH_RATIO`. Past that
+        the stretcher refuses to make a key-locked copy, so the deck resamples
+        the whole rate instead -- and a 120 BPM clock asked to play a 160 BPM
+        track resamples it by 0.75, five semitones down. Matching is given up
+        before pitch is: the track comes in at the nearest tempo the cap allows
+        and the transition has to be one that does not need a long beatmatch.
+        """
         master_bpm = self.engine.master_bpm
         if master_bpm <= 0 or candidate.bpm <= 0:
             return 1.0
-        return master_bpm / candidate.bpm
+        rate = master_bpm / candidate.bpm
+        # Half or double time first: a 160 BPM track under a 120 clock counts
+        # perfectly well at 80, and that lands inside the cap when 160 cannot.
+        # Strictly inside the cap, not on it: the supervisor's check is
+        # `abs(rate - 1.0) > MAX_RATE_DELTA` with no epsilon, and
+        # `abs(1.08 - 1.0)` is 0.08000000000000007. Clamping to the limit
+        # exactly produced a rate the supervisor then refused, which stalled
+        # cueing altogether -- measured in the 20-track soak, where only 4 of
+        # 20 tracks ever reached a deck.
+        limit = config.MAX_STRETCH_RATIO * (1.0 - 1e-9)
+        if abs(rate - 1.0) > limit:
+            for folded in (rate * 2.0, rate / 2.0):
+                if abs(folded - 1.0) <= limit:
+                    return folded
+        return float(min(1.0 + limit, max(1.0 - limit, rate)))
+
+    def _load_or_refuse(self, analysis: TrackAnalysis, origin: str):
+        """Decode a track, or say why not and remember it. Never raises.
+
+        Control thread. Returns the loaded track, or None -- and a None is
+        always accompanied by a log line naming the track and the reason, so a
+        set that quietly stops choosing something has an explanation on disk.
+        """
+        try:
+            return load_track(analysis)
+        except Exception as exc:
+            self._unplayable.add(analysis.track_id)
+            reason = f"{type(exc).__name__}: {exc}"
+            self.session_log.write(
+                "track_unplayable",
+                track=analysis.title,
+                path=str(analysis.path),
+                trigger=origin,
+                action=f"excluded for this session: {reason}",
+            )
+            self.notify(
+                f"[{origin}] {analysis.title} will not decode and has been "
+                f"set aside: {reason}"
+            )
+            log.error("could not load %s: %s", analysis.path, exc)
+            return None
+
+    def _set_aside(self, track: TrackAnalysis) -> str | None:
+        """Refuse a track whose analysis failed; say so once. Never raises."""
+        reason = an.unusable_reason(track)
+        if reason is not None and track.track_id not in self._unplayable:
+            self._unplayable.add(track.track_id)
+            self.session_log.write("track_unplayable", track=track.title,
+                                   path=str(track.path), trigger="analysis check",
+                                   action=f"excluded for this session: {reason}")
+            self.notify(f"[autopilot] {track.title} set aside: {reason}")
+        return reason
+
+    def _selectable(self) -> set[str]:
+        """Track ids autonomous selection must not offer: played, or broken."""
+        for track in self.crate:
+            self._set_aside(track)
+        return self.played | self._unplayable
 
     def start_first_track(self, energy_direction: float = 0.0) -> bool:
         """Decode and start the opening track on deck A."""
-        first = select_next(
-            self.crate, None, self.played, energy_direction,
-            set_phase=self._phase_arg(), history=self.history,
-        )
-        if first is None:
-            print("No tracks in the cache. Run `python -m djai analyze <folder>` first.")
+        loaded = None
+        # Walk down the ranking rather than dying on the first pick: an
+        # unreadable opening track used to raise out of here and the set never
+        # started at all.
+        for _ in range(len(self.crate) or 1):
+            first = select_next(
+                self.crate, None, self._selectable(), energy_direction,
+                set_phase=self._phase_arg(), history=self.history,
+            )
+            opener = self.set_plan.slots[0].track if self.set_plan and self.set_plan.slots else None
+            if opener is not None and opener.track_id not in self._selectable():
+                first = selector_mod.Candidate(
+                    track=opener, score=0.0, bpm_delta_pct=0.0, key_relation="unknown",
+                    energy_delta=0.0, penalties=("set plan opener",),
+                )
+            if first is None:
+                break
+            loaded = self._load_or_refuse(first.track, "autopilot")
+            if loaded is not None:
+                break
+        if first is None or loaded is None:
+            print("No playable tracks in the cache. Run "
+                  "`python -m djai analyze <folder>` first.")
             return False
-        loaded = load_track(first.track)
         start_frame = int(first.track.first_downbeat * SAMPLE_RATE)
         self.engine.submit(
             LoadTrack(
@@ -930,9 +2191,15 @@ class Session:
         # Kept because the deck itself cannot be asked yet: a LoadTrack is
         # applied by the audio thread on its next callback, so reading
         # deck_a.track back here is a race that returns None.
+        # Held only until the safety net has taken its own copy of the audio.
+        # Releasing it there is not enough on its own -- a session that never
+        # arms a fallback kept a whole decoded track pinned for the night --
+        # so `_release_first_track` drops it once deck A is actually playing it.
         self._first_track = loaded
         self.played.add(first.track.track_id)
         self.history.append(first.track)
+        self.set_state.history.append(first.track.track_id)
+        self.set_state.save()
         self.session_log.write(
             "track_started",
             deck="a",
@@ -942,6 +2209,7 @@ class Session:
             trigger="session start",
             action="loaded and playing",
         )
+        self.replan(f"opened on {first.track.title}")
         print(
             f"Now playing: {first.track.title}  "
             f"{first.track.bpm:.1f} BPM  {first.track.camelot} "
@@ -955,6 +2223,7 @@ class Session:
         Returns True if a track was cued. Decoding happens on the calling
         thread, which is never the audio thread.
         """
+        self._complete_handover()
         current = self.analysis_for(self.live_deck)
         idle = "b" if self.live_deck == "a" else "a"
 
@@ -962,13 +2231,26 @@ class Session:
             self.notify(f"[autopilot] deck {idle} is mid-transition, not cueing")
             self._report_no_cue(f"deck {idle} is mid-transition", origin)
             return False
+        idle_deck = self.engine.deck(idle)
+        if idle_deck.transport is TransportState.PLAYING and idle_deck.gain.target > 0.0:
+            # The engine has already handed over to this deck and the
+            # bookkeeping in _autopilot_tick has not caught up: `live_deck` is
+            # stale for a moment. Cueing here would load over the music the
+            # room is hearing -- found by the Phase 2.3 fuzz as dead air.
+            self._report_no_cue(f"deck {idle} is the one playing", origin)
+            return False
 
         forced = self._forced_next
         if forced is not None:
             # The operator named this track. It is used once and then cleared,
             # so a forced pick never silently governs the rest of the night.
             self._forced_next = None
-            loaded = load_track(forced)
+            loaded = self._load_or_refuse(forced, f"{origin}:forced")
+            if loaded is None:
+                self._report_no_cue(
+                    f"{forced.title} will not decode", origin
+                )
+                return False
             cmd = LoadTrack(
                 deck=idle,
                 track=loaded,
@@ -990,25 +2272,69 @@ class Session:
             self._cued = loaded
             self.played.add(forced.track_id)
             self.history.append(forced)
-            self.session_log.write(
+            self._cue_decision = self.session_log.decision(
                 "track_cued",
+                self.engine.features.latest(),
+                "manual override of the selector",
                 deck=idle,
                 track=forced.title,
                 trigger=f"{origin} (forced by the operator)",
-                action="manual override of the selector",
             )
+            self._count_cue(forced.track_id)
+            self._after_cue(forced)
             return True
 
+        queued = self._next_queued()
+        if queued is not None:
+            return self._cue_candidate(queued, idle, energy_direction, origin, "")
+
+        planned = self._planned_candidate(current)
+        if planned is not None:
+            return self._cue_candidate(planned, idle, energy_direction, origin, "; set plan")
+
         phase = self._phase_arg()
-        candidate = select_next(
-            self.crate, current, self.played, energy_direction,
-            set_phase=phase, history=self.history,
+        # A journey, not a next track: the plan looks several tracks ahead and
+        # only its first step is played. Re-planned at every cue, so it follows
+        # what the room actually did rather than what was planned for it.
+        # Planned from the tempo the mix is running at, not the playing
+        # track's printed one: after a ride they are different numbers, and
+        # planning from the label is what makes a cue arrive with a path the
+        # arm then measures as unreachable.
+        live_bpm = self._playing_bpm()
+        travelling = (
+            self.tempo_target is not None
+            and live_bpm > 0
+            and abs(live_bpm - self.tempo_target) >= 0.5
         )
+        journey = plan_journey(
+            self.crate, current, self._selectable(), energy_direction,
+            set_phase=phase, history=self.history, cache_dir=self.cache_dir,
+            weights=self.selector_weights, target_bpm=self.tempo_target,
+            playing_bpm=live_bpm or None, travel=travelling,
+        )
+        self.journey = journey
+        candidate = journey.first
+        if candidate is not None and journey.steps[1:]:
+            self.session_log.write(
+                "journey",
+                deck=idle,
+                track=candidate.track.title,
+                trigger=f"{origin} ({energy_direction:+.2f} energy)",
+                action=journey.reason(),
+                ahead=[c.track.title for c in journey.steps[1:]],
+            )
+        if candidate is None:
+            candidate = select_next(
+                self.crate, current, self._selectable(), energy_direction,
+                set_phase=phase, history=self.history, cache_dir=self.cache_dir,
+                weights=self.selector_weights,
+            )
         if candidate is None:
             # Nothing new fits; allow repeats rather than falling silent.
             candidate = select_next(
                 self.crate, current, set(), energy_direction,
-                set_phase=phase, history=self.history,
+                set_phase=phase, history=self.history, cache_dir=self.cache_dir,
+                weights=self.selector_weights,
             )
             if candidate is None:
                 # Nothing is within the stretch range, so no blend exists. The
@@ -1017,7 +2343,7 @@ class Session:
                 # is the difference between a jarring change and the track
                 # playing out into silence -- and silence is the one outcome
                 # this program does not allow.
-                candidate = select_nearest_tempo(self.crate, current, self.played)
+                candidate = select_nearest_tempo(self.crate, current, self._selectable())
                 if candidate is None:
                     candidate = select_nearest_tempo(self.crate, current, set())
                     if candidate is not None:
@@ -1071,8 +2397,10 @@ class Session:
         if preset is not None and preset.align_mode == "drop" and live.track is not None:
             bars = preset.length_bars + self.hold_extra_bars
             for option in rank_candidates(
-                self.crate, current, self.played, energy_direction,
-                set_phase=phase, history=self.history,
+                self.crate, current, self._selectable(), energy_direction,
+                set_phase=phase, history=self.history, cache_dir=self.cache_dir,
+                weights=self.selector_weights,
+                playing_bpm=live_bpm or None, travel=travelling,
             ):
                 if self._plan_drop_aligned(live, option.track, preset, bars) is None:
                     continue
@@ -1086,16 +2414,90 @@ class Session:
             else:
                 drop_note = "; no track's drop could be lined up, best match kept"
 
-        loaded = load_track(candidate.track)
-        rate = self._rate_for(candidate.track)
-        if self._beyond_stretch_range(candidate.track):
-            # No rate can match this tempo, so it plays at its own and the
-            # hand-over is a cut. Asking for the matched rate here would only
-            # earn a supervisor refusal and leave nothing cued.
-            rate = 1.0
+        return self._cue_candidate(candidate, idle, energy_direction, origin, drop_note)
+
+    def _planned_candidate(self, current):
+        """The set plan's next slot, if there is a plan and it still stands.
+
+        The slot must be unplayed, playable and reachable inside the cap from
+        the tempo the mix is at now; otherwise the plan has gone stale and the
+        journey chooses (the replan after that cue repairs the plan).
+        """
+        plan = self.set_plan
+        if plan is None or not plan.slots:
+            return None
+        slot = next((x for x in plan.slots if not x.cued), None)
+        if slot is None or slot.track.track_id in self._selectable():
+            return None
+        for c in rank_candidates(
+            self.crate, current, self._selectable(), self.energy_direction,
+            set_phase=self._phase_arg(), history=self.history, cache_dir=self.cache_dir,
+            weights=self.selector_weights, playing_bpm=self._playing_bpm() or None,
+            travel=True,
+        ):
+            if c.track.track_id == slot.track.track_id:
+                return c
+        return None
+
+    def _next_queued(self):
+        """The due operator cue as a Candidate, or None. Takes it off the queue.
+
+        A cue whose file is gone is reported to the operator and the log,
+        taken off the queue, and the next one is tried: the queue continues.
+        """
+        while True:
+            entry = self._due_cue()
+            if entry is None:
+                return None
+            track = self._track_by_id(entry["track_id"])
+            if track is None or self._set_aside(track) or track.track_id in self._unplayable:
+                self.cue_queue.remove(entry)
+                self.set_state.save()
+                why = f"cued track {entry['title']} is missing or unreadable; skipped"
+                self.session_log.write("cue_missing", track=entry["title"],
+                                       trigger="cue queue", action=why)
+                self.notify(f"[cue] {why}")
+                continue
+            if not entry.get("bridge") and self._check_bridge(entry):
+                return None      # the gap grew past the cap since it was queued
+            self.cue_queue.remove(entry)
+            self.set_state.save()
+            if getattr(track, "quarantined", False):
+                self._conservative[track.track_id] = "quarantined grid: echo out into it"
+            if entry.get("bridge") == "tempo":
+                self._conservative[track.track_id] = "tempo bridge: echo out, own tempo"
+            current = self.analysis_for(self.live_deck)
+            path = self._cap_path(track)
+            return selector_mod.Candidate(
+                track=track, score=0.0,
+                bpm_delta_pct=(
+                    (track.bpm - self._playing_bpm()) / self._playing_bpm() * 100.0
+                    if self._playing_bpm() else 0.0
+                ),
+                key_relation=(selector_mod.key_relation(current.camelot, track.camelot)
+                              if current else "unknown"),
+                energy_delta=0.0, penalties=(f"cued by the operator (cue {entry['id']})",),
+                tempo_path=path,
+            )
+
+    def _cue_candidate(self, candidate, idle: str, energy_direction: float,
+                       origin: str, drop_note: str) -> bool:
+        """Load, place and cue a chosen track: the tail every choice shares."""
+        loaded = self._load_or_refuse(candidate.track, origin)
+        if loaded is None:
+            # Set aside and try again at once: the next tick would otherwise
+            # rank the same unreadable file first all over again.
+            return self.cue_next(energy_direction, origin=origin)
+        loaded = self._at_mix_point(loaded)
+        # How these two tempos are going to meet: straight, by riding the
+        # playing deck toward it, or counted half or double. The 8% wall is
+        # gone; what is left is a path or the absence of one.
+        path = self.tempo_path_to(candidate.track)
+        self.tempo_plan = path
+        rate = path.rate_b if path.blendable else 1.0
         # Park the cued deck on its mix-in so `state` shows where it will
         # actually come in; arm_transition re-cues to the same point.
-        start_frame = int(candidate.track.mix_in * SAMPLE_RATE)
+        start_frame = int(loaded.analysis.mix_in * SAMPLE_RATE)
 
         cmd = LoadTrack(
             deck=idle,
@@ -1114,28 +2516,203 @@ class Session:
 
         self.engine.submit(cmd)
         self.engine.deck(idle).gain.jump(0.0)
+        self.engine.deck(idle).metric_ratio = path.ratio if path.blendable else 1.0
         self._cued = loaded
         self.played.add(candidate.track.track_id)
         self.history.append(candidate.track)
-        self.session_log.write(
+        if path.technique not in ("direct", "none"):
+            self.session_log.write(
+                "tempo_path",
+                deck=idle,
+                track=candidate.track.title,
+                trigger=f"{self.engine.master_bpm:.1f} -> {candidate.track.bpm:.1f} BPM",
+                action=path.describe(),
+                technique=path.technique,
+                ratio=path.ratio,
+                ride_percent=round(path.ride_percent, 4),
+                bars=path.bars,
+            )
+        if path.ride_percent:
+            self._schedule_tempo_ride(path)
+        self._cue_decision = self.session_log.decision(
             "track_cued",
+            self.engine.features.latest(),
+            candidate.reason() + drop_note,
             deck=idle,
             track=candidate.track.title,
             trigger=f"{origin} ({energy_direction:+.2f} energy)",
-            action=candidate.reason() + drop_note,
         )
         # The pre-roll window: the transition is a phrase or more away, so this
         # is where a design is asked for. It runs on its own thread and nothing
         # waits for it -- if it is not back by the time the transition is
         # armed, the preset runs instead.
         self.start_transition_design(candidate.track)
+        self._count_cue(candidate.track.track_id)
+        self._after_cue(candidate.track)
         return True
+
+    def _after_cue(self, track: TrackAnalysis) -> None:
+        """Revise the plan within one track of whatever was just cued."""
+        plan = self.set_plan
+        if plan is None:
+            return
+        expected = plan.slots[0].track if plan.slots else None
+        if expected is not None and expected.track_id != track.track_id:
+            self.session_log.write(
+                "plan_deviation", track=track.title, trigger="cue",
+                action=f"planned {expected.title}, cued {track.title}",
+            )
+            self.replan(f"off-plan: {track.title} instead of {expected.title}")
+        else:
+            self.replan(f"cued {track.title}")
+
+    def _at_mix_point(self, loaded: LoadedTrack) -> LoadedTrack:
+        """Apply a one-shot ranked mix-in target (SPEC §3 `cue` action).
+
+        A copy of the analysis with its mix-in moved, never the crate's own:
+        the crate's entry is shared by every later selection. Placement reads
+        the deck's analysis, so everything downstream agrees on the point.
+        """
+        rank, self.cue_mix_point = self.cue_mix_point, None
+        regions = loaded.analysis.mix_in_regions
+        if not rank or not regions:
+            return loaded
+        region = regions[min(rank, len(regions)) - 1]
+        analysis = dataclasses.replace(
+            loaded.analysis, mix_in=float(region["seconds"]),
+            mix_in_bar=float(region["bar"]),
+        )
+        self.session_log.write(
+            "mix_point_target", track=analysis.title,
+            trigger=f"cue action: mix point {rank}",
+            action=f"mix in at bar {region['bar']} (quality {region['quality']:.2f})",
+        )
+        return dataclasses.replace(loaded, analysis=analysis)
 
     def cued_deck(self) -> str:
         return "b" if self.live_deck == "a" else "a"
 
     def has_cued_track(self) -> bool:
         return self._cued is not None
+
+    def reload_feedback(self) -> dict[str, Any]:
+        """Work out the weights in use. Control thread; reads files.
+
+        The stable model is the current stored version (djai.feedback); on the
+        very first start with logs and no model, one is trained, which is what
+        this method used to do every time. Tonight's layer is re-learned from
+        this session's own log on every call -- at start, on every verdict or
+        label, on a persona change -- so pressing a button changes the next
+        pick rather than the next night, and never touches the stable model.
+        """
+        from djai import feedback as feedback_mod
+
+        log_dir = self.session_log.path.parent
+        if self._stable_model is None and not self._model_checked:
+            # Once per session. The bootstrap reads every log but tonight's:
+            # tonight belongs to the night layer until someone says `model
+            # learn`, or it would be counted in both.
+            self._model_checked = True
+            mdir = feedback_mod.model_dir(log_dir)
+            self._stable_model = feedback_mod.load(mdir)
+            if self._stable_model is None and any(
+                p != self.session_log.path and feedback_mod.read_log(p)
+                for p in log_dir.glob("session_*.jsonl")
+            ):
+                self._stable_model = feedback_mod.train(
+                    log_dir, note="first start", exclude=self.session_log.path)
+        night = feedback_mod.night_layer(
+            feedback_mod.read_log(self.session_log.path, self._night_from))
+        eff = feedback_mod.effective(self._stable_model, night, self.persona)
+        self.selector_weights = dict(eff["selector"])
+        self.critic_weights = dict(eff["critic"])
+        self.timing_bias_bars = int(eff["timing_bias_bars"])
+        summary = dict(night.get("summary") or {})
+        stable = self._stable_model or {}
+        summary["model_version"] = stable.get("version")
+        summary["stable"] = ((stable.get("global") or {}).get("summary") or {}).get("learning", "")
+        summary["night"] = summary.get("learning", "")
+        summary["learning"] = (
+            f"model v{stable.get('version')}" if stable else "no stored model"
+        ) + (f"; tonight: {summary['night']}" if summary["night"] else "")
+        self.feedback_summary = summary
+        return {"selector": self.selector_weights, "critic": self.critic_weights,
+                "timing_bias_bars": self.timing_bias_bars, "summary": summary}
+
+    def record_feedback(self, label: str, note: str = "") -> str:
+        """The operator's word on what just happened. Any control thread.
+
+        Written with everything a learner needs -- the transition's two tracks,
+        its style, what the critic measured, how alike the pair was, the
+        persona, and for timing labels where the blend sat -- then tonight's
+        layer is re-learned at once.
+        """
+        from djai import feedback as feedback_mod
+
+        if label not in feedback_mod.VERDICTS:
+            raise ValueError(f"verdict must be one of {feedback_mod.VERDICTS}, got {label!r}")
+        live = self.engine.deck(self.live_deck)
+        other = self.engine.deck(self.cued_deck())
+        outgoing = other.track.analysis.title if other.track is not None else None
+        incoming = live.track.analysis.title if live.track is not None else None
+        outcome = self.last_preview
+        critic_rounds = getattr(outcome, "critic", []) if outcome is not None else []
+        last = critic_rounds[-1] if critic_rounds else {}
+        similarity = {}
+        if self.journey is not None and getattr(self.journey, "first", None) is not None:
+            similarity = dict(self.journey.first.similarity or {})
+        context = {}
+        if label in (feedback_mod.TOO_EARLY, feedback_mod.TOO_LATE):
+            context = {"timing_bias_bars": self.timing_bias_bars,
+                       "transition_active": self.engine.transition_active}
+        if label in (feedback_mod.MORE_LIKE_THIS, feedback_mod.LESS_LIKE_THIS):
+            context = {"track": incoming,
+                       "track_id": live.track.analysis.track_id if live.track else None}
+        feedback_mod.record(
+            self.session_log, label, tracks=(outgoing, incoming),
+            style=self.last_transition_choice[0] if self.last_transition_choice else "",
+            critic_score=last.get("score"), worst_measure=last.get("worst") or "",
+            similarity=similarity, note=note, persona=self.persona, context=context,
+        )
+        learned = self.reload_feedback()
+        return f"Noted: {label.replace('_', ' ')}. {learned['summary'].get('learning', '')}"
+
+    def model_text(self, words: str) -> str:
+        """`model`, `model learn`, `model rollback [v]`, `model versions`."""
+        from djai import feedback as feedback_mod
+
+        log_dir = self.session_log.path.parent
+        mdir = feedback_mod.model_dir(log_dir)
+        parts = words.split()
+        word = parts[0] if parts else ""
+        if word == "learn":
+            self._stable_model = feedback_mod.train(log_dir, note="operator: model learn")
+            # Tonight so far is in the stable model now; the night layer starts
+            # again from here rather than counting it twice.
+            self._night_from = self.session_log.path.stat().st_size
+            self.reload_feedback()
+            self.session_log.write("model_trained", trigger="operator",
+                                   action=f"v{self._stable_model['version']}",
+                                   events=self._stable_model["events"])
+            return (f"Trained model v{self._stable_model['version']} on "
+                    f"{self._stable_model['events']} event(s).")
+        if word == "rollback":
+            try:
+                version = feedback_mod.rollback(
+                    mdir, int(parts[1].lstrip("v")) if len(parts) > 1 else None)
+            except (ValueError, IndexError) as exc:
+                return f"Cannot roll back: {exc}"
+            self._stable_model = feedback_mod.load(mdir, version)
+            self.reload_feedback()
+            self.session_log.write("model_rollback", trigger="operator", action=f"v{version}")
+            return f"Model v{version} is current."
+        if word == "versions":
+            have = feedback_mod.versions(mdir)
+            now = feedback_mod.current_version(mdir)
+            return ("Models: " + ", ".join(f"v{v}{'*' if v == now else ''}" for v in have)
+                    if have else "No stored models.")
+        return (f"{self.feedback_summary.get('learning', '')}. Selector x{self.selector_weights}, "
+                f"critic x{self.critic_weights}, blend length {self.timing_bias_bars:+d} bars.")
 
     def _report_no_cue(self, reason: str, origin: str = "autopilot") -> None:
         """Say loudly that no next track is cued, and why. Any control thread.
@@ -1304,6 +2881,7 @@ class Session:
         choice: "transition.TransitionChoice",
         incoming: TrackAnalysis,
         safety_forced: bool,
+        residual: float = 0.0,
     ) -> tuple["transition.TransitionParams", str, str]:
         """Decide the shape of this transition. ``(params, source, note)``.
 
@@ -1325,7 +2903,9 @@ class Session:
 
         raw, reason = self.take_design(incoming)
         if raw is None:
-            return preset, "preset", f"no design used ({reason})"
+            return self._generated_or(
+                preset, choice, incoming, residual, f"no design used ({reason})"
+            )
 
         live = self.engine.deck(self.live_deck)
         outgoing = live.track.analysis if live.track else None
@@ -1342,11 +2922,106 @@ class Session:
                 fell_back_to=preset.name,
             )
             self.notify(f"[design] rejected ({why}) - using {preset.name}")
-            return preset, "rejected", f"design rejected: {why}"
+            return self._generated_or(
+                preset, choice, incoming, residual, f"design rejected: {why}",
+                source="rejected",
+            )
 
         return params, "llm", "designed"
 
-    def abort_armed_transition(self) -> int:
+    def _mode_for(self, energy_delta: float) -> str:
+        """The transition mode for this pair: the operator's, or by context."""
+        if self.transition_mode in transition.MODES:
+            return self.transition_mode
+        persona = planner.PERSONAS.get(self.persona)
+        if persona is not None and persona.mode in transition.MODES:
+            return persona.mode
+        rising = energy_delta > transition.ENERGY_RISE - 1.0
+        if self.set_phase == "peak" or self.energy_direction > 0.3 or rising:
+            return "showy"
+        return "invisible"
+
+    def _pair_context(
+        self, choice: "transition.TransitionChoice", incoming: TrackAnalysis,
+        residual: float,
+    ) -> "transition.PairContext":
+        """What the generator is told about this pair. Control thread."""
+        live = self.engine.deck(self.live_deck)
+        outgoing = live.track.analysis if live.track is not None else None
+        if outgoing is None:
+            return transition.PairContext(base_style=choice.style)
+        out_q = outgoing.mix_out_regions[0]["quality"] if outgoing.mix_out_regions else None
+        in_q = incoming.mix_in_regions[0]["quality"] if incoming.mix_in_regions else None
+        quality = out_q * in_q if out_q is not None and in_q is not None else None
+        position_s = float(live.position) / SAMPLE_RATE
+        return transition.PairContext(
+            base_style=choice.style,
+            bpm_residual=float(residual),
+            energy_delta=(
+                float(incoming.energy) / float(outgoing.energy) - 1.0
+                if outgoing.energy > 0 else 0.0
+            ),
+            keys_compatible=transition.camelot_compatible(
+                outgoing.camelot, incoming.camelot
+            ),
+            mix_quality=quality,
+            outro_falling=(
+                transition._in_outro(outgoing, position_s)
+                and transition._energy_falling(outgoing, position_s)
+            ),
+            drops=(
+                transition.drop_cue(outgoing) is not None
+                and transition.drop_cue(incoming) is not None
+            ),
+        )
+
+    def _generated_or(
+        self,
+        preset: "transition.TransitionParams",
+        choice: "transition.TransitionChoice",
+        incoming: TrackAnalysis,
+        residual: float,
+        note: str,
+        source: str = "generated",
+    ) -> tuple["transition.TransitionParams", str, str]:
+        """A transition generated for this pair, or the preset if none passes.
+
+        Every candidate goes through the supervisor's own parameter check; one
+        it refuses is never returned. Seeded from the set seed, the pair and
+        the transition's index, so the same set generates the same shapes.
+        """
+        import zlib
+
+        live = self.engine.deck(self.live_deck)
+        outgoing = live.track.analysis if live.track is not None else None
+        ctx = self._pair_context(choice, incoming, residual)
+        mode = self._mode_for(ctx.energy_delta)
+        seed = zlib.crc32(
+            f"{self.set_seed}|{outgoing.track_id if outgoing else ''}|"
+            f"{incoming.track_id}|{len(self.shape_history)}".encode()
+        )
+
+        def accept(params):
+            ok, why = self.supervisor.validate_transition_params(
+                dict(params.to_schema()), incoming, outgoing
+            )
+            return ok is not None, why
+
+        generated = transition.generate_transition(
+            ctx, mode, seed, self.shape_history, accept
+        )
+        if generated is None:
+            return preset, "preset", f"{note}; no generated shape passed the supervisor"
+        # The supervisor rebuilds params from the schema, dropping the name;
+        # the generated object is what runs, having passed the same check.
+        self.session_log.write(
+            "transition_generated", trigger=note, action=generated.rule,
+            shape=generated.shape, mode=mode, seed=seed, score=generated.score,
+            params=generated.params.to_schema(),
+        )
+        return generated.params, source, f"{note}; generated {generated.rule}"
+
+    def abort_armed_transition(self, trigger: str = "deck paused mid-transition") -> int:
         """Drop a transition that was scheduled but has not fired. Returns count.
 
         Aborting the crossfade in the engine is not enough on its own: the
@@ -1362,7 +3037,7 @@ class Session:
         if not self._transition_armed:
             return 0
         dropped = self.scheduler.cancel_matching(
-            lambda c: isinstance(c, StartTransition)
+            lambda c: isinstance(c, (StartTransition, SwapStems))
             or (isinstance(c, LoadTrack) and c.play and not c.is_immediate)
         )
         self._transition_armed = False
@@ -1370,7 +3045,7 @@ class Session:
         if dropped:
             self.session_log.write(
                 "transition_aborted",
-                trigger="deck paused mid-transition",
+                trigger=trigger,
                 action=f"dropped {len(dropped)} scheduled command(s)",
             )
         return len(dropped)
@@ -1846,7 +3521,8 @@ class Session:
         )
 
     def arm_transition(
-        self, origin: str = "autopilot", at_next_phrase: bool = False
+        self, origin: str = "autopilot", at_next_phrase: bool = False,
+        at_bars: int | None = None,
     ) -> int | None:
         """Schedule the bass swap so it *finishes* at the live deck's mix-out.
 
@@ -1860,6 +3536,7 @@ class Session:
         Returns the engine frame it will fire at, or None if it could not be
         armed.
         """
+        self._complete_handover()
         live = self.engine.deck(self.live_deck)
         idle_name = self.cued_deck()
         incoming = self._cued
@@ -1868,8 +3545,32 @@ class Session:
 
         # Style first: it decides how long the blend is, and the length is an
         # input to placement, not something that can be retrofitted after it.
+        # The tempo path is recomputed here rather than reused from the cue:
+        # a ride scheduled then may have partly or wholly landed by now, and
+        # the master clock is what says where the mix actually is.
+        path = self.tempo_path_to(incoming.analysis)
+        # The tempo the clock will be counting when the blend starts, which
+        # after a ride still in flight is not the one it counts now. Arming
+        # against today's number and blending at tomorrow's is how the two
+        # decks walk apart while they are both audible.
+        master_bpm = self._planned_master_bpm() or (
+            live.track.analysis.bpm * max(live.rate, 1e-6)
+        )
+        ratio = path.ratio if path.blendable else 1.0
+        counted = incoming.analysis.bpm * ratio
+        matched_rate = master_bpm / counted if counted > 0 else 1.0
+        limit = config.MAX_STRETCH_RATIO
+        rate_b = min(max(matched_rate, 1.0 - limit), 1.0 + limit)
+        # What is left after the deck has stretched as far as it may: the ride
+        # in flight closes the rest, and this is the gap a style rule should
+        # judge rather than the raw difference between two printed tempos.
+        residual = (
+            abs(counted * rate_b - master_bpm) / master_bpm if master_bpm > 0 else 1.0
+        )
         choice = transition.choose_transition(
-            live, incoming.analysis, {"style": self.transition_style}
+            live, incoming.analysis,
+            {"style": self.transition_style,
+             "bpm_delta": residual if path.blendable else None},
         )
 
         # Safety beats the designer, unconditionally. A weak grid or a tempo
@@ -1877,9 +3578,31 @@ class Session:
         safety_forced = choice.style == "cut" and (
             "grid confidence" in choice.rule or "BPM delta" in choice.rule
         )
-        params, source, design_note = self._params_for(
-            choice, incoming.analysis, safety_forced
-        )
+        conservative = self._conservative.get(incoming.analysis.track_id)
+        if conservative is not None:
+            # An operator's cue the grid or the tempo cannot hold a long blend
+            # on: an echo out into its clean mix-in, never a cut (Phase 3.2).
+            safety_forced = False
+            params = transition.preset_params("echo_out")
+            source, design_note = "cue", conservative
+            choice = choice._replace(style="echo_out", rule=f"operator cue: {conservative}")
+        elif at_bars and not safety_forced:
+            # "Play now": a short showy gesture, generated like any other.
+            ctx = self._pair_context(choice, incoming.analysis, residual)
+            outgoing = live.track.analysis
+            short = transition.generate_transition(
+                ctx, "showy", len(self.shape_history), self.shape_history,
+                lambda prm: (
+                    prm.length_bars <= at_bars and self.supervisor.validate_transition_params(
+                        prm.to_schema(), incoming.analysis, outgoing)[0] is not None, ""),
+            )
+            params = short.params if short else transition.preset_params("echo_out")
+            source, design_note = "play_now", (short.rule if short else "echo_out preset")
+        else:
+            params, source, design_note = self._params_for(
+                choice, incoming.analysis, safety_forced,
+                residual if path.blendable else 0.0,
+            )
         if params.name == "cut":
             choice = choice._replace(style="cut")
 
@@ -1901,7 +3624,27 @@ class Session:
             # the transition sits is still worked out backwards from mix-out by
             # plan_transition; nothing here decides that.
             requested_bars = params.length_bars + self.hold_extra_bars
-            if at_next_phrase:
+            if self.timing_bias_bars:
+                # Learned from "too early" / "too late": a shorter blend, planned
+                # back from mix-out, starts later. Never shorter than the floor
+                # a blend needs, nor than the design itself asked for.
+                floor = min(phrase.MIN_TRANSITION_BARS, params.length_bars)
+                requested_bars = max(floor, requested_bars + self.timing_bias_bars)
+            if at_bars:
+                # The next line of `at_bars` bars at least a bar away: close
+                # enough to be "now", far enough to schedule on a bar line.
+                analysis_a = live.track.analysis
+                bar = phrase.bar_at_frame(analysis_a, live.position)
+                target = (math.floor(bar / at_bars) + 1) * at_bars
+                if target - bar < 1.0:
+                    target += at_bars
+                plan = phrase.TransitionPlan(
+                    start_frame=int(round(phrase.frame_at_bar(analysis_a, target))),
+                    bars=params.length_bars,
+                    entry_frame_b=int(round(incoming.analysis.mix_in * SAMPLE_RATE)),
+                    reason=f"play now: next {at_bars}-bar line",
+                )
+            elif at_next_phrase:
                 # "Go now": the user asked, so this is an alignment question,
                 # not a placement one. Next musically valid moment, requested
                 # length, mix-out ignored. This is the only caller of
@@ -2072,20 +3815,21 @@ class Session:
         )
         self.design_counts[source] += 1
         self.style_counts[armed_style] += 1
+        self.shape_history.append(transition.shape_signature(params))
 
         # Beyond the stretch range nothing can be matched, so the incoming deck
         # plays at its own tempo and takes the beat clock with it: the outgoing
         # deck is one block from being silent, and leaving the clock behind
         # would have the supervisor resyncing the new track against a tempo
         # nothing is playing.
-        unmatched = self._beyond_stretch_range(incoming.analysis)
+        unmatched = not path.blendable
         load = LoadTrack(
             deck=idle_name,
             track=incoming,
             # Its mix-in, never its first sample: entering on an intro that has
             # no beat is the other half of the placement bug.
             start_frame=entry_frame_b,
-            rate=1.0 if unmatched else self._rate_for(incoming.analysis),
+            rate=1.0 if unmatched else rate_b,
             play=True,
             execute_at=execute_at,
             origin=origin,
@@ -2105,6 +3849,10 @@ class Session:
         # too -- validating only the load would leave the regression uncovered.
         if self.supervisor.validate(swap) is not None:
             return None
+        self._drop_late_ride_steps(swap.execute_at)
+        #: The tempo the set is at going into this transition, so the hand-over
+        #: at the far end can say what the journey actually moved.
+        self._clock_at_arm = master_bpm
         # Recorded BEFORE the commands are queued: the pre-roll hook can fire as
         # soon as the swap is in the scheduler, and it identifies the transition
         # it is allowed to touch by these exact command objects.
@@ -2119,8 +3867,26 @@ class Session:
             "drop_aligned": drop_aligned,
             "previewed": False,
         }
+        if self._transition_armed:
+            # Re-armed -- `go` over a blend the autopilot already queued. The
+            # earlier pair is withdrawn, or both fire and the second lands in
+            # the first's blend (found by the Phase 2.3 fuzz).
+            self.scheduler.cancel_matching(
+                lambda c: isinstance(c, StartTransition)
+                or (isinstance(c, LoadTrack) and c.play and not c.is_immediate)
+            )
         self.scheduler.submit(load)
         self.scheduler.submit(swap)
+
+        # The blend owns both decks from here. A plan or an energy move queued
+        # before it was armed must not land in it: a fader step on a deck in a
+        # running blend ends the blend part-way (manual level outranks
+        # automation), and the Phase 2.3 fuzz traced a silent set to exactly
+        # that. Withdrawn, with any gesture they opened closed.
+        for token in (self._action_token, self._energy_token):
+            if token is not None:
+                for cmd in glue.closing_commands(self.scheduler.cancel(token)):
+                    self.scheduler.submit(cmd)
 
         self._transition_armed = True
         # Stem moves are planned only now: they are swaps around a transition
@@ -2384,6 +4150,7 @@ class Session:
             supervisor=self.supervisor,
             session_log=self.session_log,
             blocksize=self.engine.blocksize,
+            weights=self.critic_weights or None,
         )
         try:
             note = self._commit_preview(cmd, armed, outcome, live)
@@ -2420,7 +4187,9 @@ class Session:
         # A revised preset is no longer the preset, and the arm path builds a
         # named preset from its own builder -- which would quietly throw the
         # revision away. So it is renamed and armed through the params path.
-        if new.name in transition.STYLES:
+        # A generated shape (SPEC §4) already arms by params; it is renamed
+        # too, so the log says the preview changed it.
+        if new.name in transition.STYLES or new.name.startswith("gen_"):
             new = dataclasses.replace(new, name=f"{new.name}+preview")
         if armed["drop_aligned"]:
             new = dataclasses.replace(new, entry_point=original.entry_point)
@@ -2640,6 +4409,21 @@ class Session:
                 except Exception:
                     pass  # reporting must never be what kills the loop
 
+    def _release_first_track(self) -> None:
+        """Drop the opening track once it is no longer the only copy.
+
+        `_first_track` exists so the safety net can be armed from whatever
+        opened the set, before anything else is decoded. Once deck A holds that
+        audio -- or the fallback has copied it -- this reference is redundant,
+        and keeping it pinned a whole decoded track (84.7 MB, measured) for the
+        length of the session.
+        """
+        first = self._first_track
+        if first is None:
+            return
+        if self.watchdog is not None or self.engine.deck_a.track is first:
+            self._first_track = None
+
     def _release_stretches(self) -> None:
         """Free stretched copies the finished transition left unused.
 
@@ -2696,9 +4480,178 @@ class Session:
         )
         self.notify(f"[autopilot] deck ran out - starting {incoming.title} now")
 
+    #: Real seconds of audio left at which a deck about to run dry is covered:
+    #: a tick to cue, a tick to arm, the next bar line and a one-bar blend.
+    RUN_DRY_S: float = 10.0
+
+    def _run_dry(self, live) -> bool:
+        """The live deck's audio is about to stop with no blend to cover it.
+
+        A truncated or damaged file ends long before its analysed mix-out, or a
+        blend never armed. Waiting for ``ended`` cost a tick to cue and a tick
+        to start: 518 ms of dead air, measured. Instead the cued track comes in
+        on the next bar line through the play-now path -- a real transition, so
+        the hand-over bookkeeping is the ordinary one. Returns True when it
+        acted, so nothing else runs this tick.
+        """
+        if (self.frozen or self.engine.transition_active or live.loop_active or live.ended
+                or live.transport is not TransportState.PLAYING or live.track is None):
+            return False
+        left_s = live.remaining_frames / SAMPLE_RATE / max(live.rate, 1e-6)
+        if left_s > self.RUN_DRY_S:
+            return False
+        end_at = self.engine.frames_played + left_s * SAMPLE_RATE
+        bar = 4.0 * SAMPLE_RATE * 60.0 / max(self.engine.master_bpm or 120.0, 1.0)
+        if self._transition_armed:
+            starts = [c.execute_at for c in self.scheduler.pending()
+                      if isinstance(c, StartTransition)]
+            if starts and min(starts) + bar < end_at:
+                return False          # the armed blend starts in time
+            cued = self._cued
+            self.abort_armed_transition(trigger="live deck runs dry before the blend")
+            self._cued = cued
+        if not self.has_cued_track():
+            self.cue_next(origin="recovery")   # lands on the deck next block
+            return True
+        at = self.arm_transition(origin="recovery", at_bars=1)
+        if at is None:
+            return False   # silence recovery covers the end
+        self.session_log.write(
+            "run_dry", track=self._cued.title if self._cued else None,
+            trigger=f"live deck's audio ends in {left_s:.1f} s, before its mix-out",
+            action=f"blend on the next bar line, {self.bars_until(at):.2f} bars out",
+        )
+        self.notify(f"[autopilot] {live.track.analysis.title} is running out - "
+                    "bringing the next track in on the bar")
+        return True
+
+    def _complete_handover(self) -> bool:
+        """Bring the bookkeeping up to date with a hand-over the engine made.
+
+        Returns True if one was completed. Called from the autopilot tick and
+        at the top of everything that reads ``live_deck`` to decide where the
+        next track goes -- a cue or an arm between the engine finishing a blend
+        and the next tick otherwise acts on the deck that just stopped, and
+        loads over the one the room is hearing (Phase 2.3 fuzz, three routes).
+        """
+        live = self.engine.deck(self.live_deck)
+        if live.track is None:
+            return False
+        # The transition finished: the incoming deck is now live. Also when no
+        # blend was armed but the other deck is the one the room hears -- a
+        # cancel that raced the blend's own ending, or a hand-over by hand.
+        # The bookkeeping follows the audio, never the other way round.
+        if not self.engine.transition_active and (
+            self._transition_armed
+            or self.engine.deck(self.cued_deck()).gain.target > 0.0
+        ):
+            other = self.cued_deck()
+            incoming = self.engine.deck(other)
+            if (
+                incoming.transport is TransportState.PLAYING
+                and live.transport is not TransportState.PLAYING
+            ):
+                self.live_deck = other
+                self._transition_armed = False
+                self.hold_extra_bars = 0
+                self._cued = None
+                incoming_deck = self.engine.deck(other)
+                ratio = float(getattr(incoming_deck, "metric_ratio", 1.0))
+                metric = abs(ratio - 1.0) > 1e-6
+                # The beat clock follows the deck that is now the mix. Whatever
+                # tempo the set arrived at through this hand-over -- a ride, a
+                # half-time count, or simply the track's own speed -- is the
+                # tempo the next one is planned from. Leaving the clock on the
+                # track that just ended pins the whole night to what it opened
+                # at and quietly undoes every journey: the next track is
+                # stretched back and eventually cut for being too far away.
+                # The engine hands the clock over in the callback as the
+                # crossfade ends, so by now it has usually already moved: the
+                # tempo the set was *at* is the one recorded when this
+                # transition was armed, and that is what this compares against.
+                before = self._clock_at_arm or self.engine.master_bpm
+                if metric:
+                    for name in ("a", "b"):
+                        self.engine.deck(name).metric_ratio = 1.0
+                for name in ("a", "b"):
+                    self.supervisor.forget_baseline(name)
+                after = self.engine.hand_master_to(other)
+                if self._cue_decision is not None:
+                    # The window over the cue closes here: the blend it was
+                    # taken for has finished, so there is now an outcome.
+                    self.session_log.outcome(
+                        self._cue_decision,
+                        self.engine.features.latest(),
+                        trigger="transition finished",
+                        action=f"handed over to deck {other}",
+                    )
+                    self._cue_decision = None
+                # Everything this transition was holding goes now. Each of
+                # these pins a whole decoded track -- 70-120 MB -- and none of
+                # them was ever cleared, only overwritten by the next
+                # transition. Measured over a 40-minute set: 31 LoadedTracks
+                # alive holding 2.4 GB while two tracks had been played, which
+                # is what drove the machine into paging and put 40 blocks over
+                # the callback budget in the 4-hour soak.
+                #
+                # `_armed_preview` is identity-compared under `_preview_lock`
+                # (see _replace_armed), and None correctly reads there as "a
+                # new transition was armed meanwhile", so dropping it is safe
+                # as well as necessary.
+                with self._preview_lock:
+                    self._armed_preview = None
+                self._stem_origin.clear()
+                self.stem_moves = []
+                self._pending_stem_moves = []
+                # The hand-over alone cannot move the clock -- it adopts the
+                # tempo this deck was already matched to. The glide is what
+                # actually takes the set to the incoming track's own BPM.
+                self._schedule_master_glide(other)
+                if self.room is not None:
+                    self.room.handover()
+                    self._room_deferred = False
+                if metric or abs(after - before) > 0.05:
+                    self.session_log.write(
+                        "metric_handover" if metric else "tempo_handover",
+                        deck=other,
+                        track=(
+                            incoming_deck.track.analysis.title
+                            if incoming_deck.track is not None else None
+                        ),
+                        from_bpm=round(before, 2),
+                        to_bpm=round(after, 2),
+                        trigger=(
+                            f"x{ratio:g} counted mix finished" if metric
+                            else "mix finished at a new tempo"
+                        ),
+                        action=f"beat clock now {after:.1f} BPM",
+                    )
+                self._drop_unlanded_ride()
+                self._release_stretches()
+                new = self.engine.deck(self.live_deck).track
+                if new is not None:
+                    self.notify(f"[autopilot] now playing {new.analysis.title}")
+                    self.session_log.write(
+                        "transition_complete",
+                        deck=self.live_deck,
+                        track=new.analysis.title,
+                        trigger="transition finished",
+                        action="deck is now live",
+                    )
+                return True
+        return False
+
     def _autopilot_tick(self) -> None:
         if self.engine.stop_requested:
             return
+
+        # Before anything looks at the tempo: the clock follows a ride in
+        # flight, so what the cue and the arm measure is where the mix is.
+        self._follow_ride()
+        try:
+            self._room_tick()
+        except Exception as exc:  # noqa: BLE001 - the loop is never worth the set
+            log.warning("closed loop tick raised: %s", exc)
 
         # Arm the safety net as soon as there is decoded audio to fall back to.
         # On an idle start nothing is decoded at launch, so a deck reaching
@@ -2720,6 +4673,8 @@ class Session:
                 "engine is not advancing, so nothing can be cued until it is "
                 "released"
             )
+
+        self._release_first_track()
 
         live = self.engine.deck(self.live_deck)
 
@@ -2755,30 +4710,11 @@ class Session:
         if live.track is None:
             return
 
-        # The transition finished: the incoming deck is now live.
-        if self._transition_armed and not self.engine.transition_active:
-            other = self.cued_deck()
-            incoming = self.engine.deck(other)
-            if (
-                incoming.transport is TransportState.PLAYING
-                and live.transport is not TransportState.PLAYING
-            ):
-                self.live_deck = other
-                self._transition_armed = False
-                self.hold_extra_bars = 0
-                self._cued = None
-                self._release_stretches()
-                new = self.engine.deck(self.live_deck).track
-                if new is not None:
-                    self.notify(f"[autopilot] now playing {new.analysis.title}")
-                    self.session_log.write(
-                        "transition_complete",
-                        deck=self.live_deck,
-                        track=new.analysis.title,
-                        trigger="transition finished",
-                        action="deck is now live",
-                    )
-                return
+        if self._complete_handover():
+            return
+
+        if self._run_dry(live):
+            return
 
         if self.engine.transition_active or self._transition_armed:
             # Armed, yet nothing queued and nothing running: the hand-off this
@@ -2803,6 +4739,15 @@ class Session:
                 self._stuck_arm_since = None
             return
         self._stuck_arm_since = None
+
+        # "Play now" was cued last tick; its LoadTrack has landed, so arm it on
+        # the next 4-bar line with a glue swell on the way out. The operator's
+        # own request, so it runs even while automation is held.
+        if self._play_now is not None and self.has_cued_track():
+            landed = self.engine.deck(self.cued_deck()).track
+            if landed is not None and landed.analysis.track_id == self._play_now:
+                self._arm_play_now(live)
+            return
 
         # Held automation gates the scheduler itself, not just the banner in
         # the UI. It comes first so that nothing below it -- cueing, arming, or
@@ -2861,6 +4806,9 @@ class Session:
         # A design is still being written and there is room to wait for it.
         # Nothing blocks: the next tick asks again.
         if self.design_pending():
+            return
+
+        if self._arm_held(live):
             return
 
         execute_at = self.arm_transition()
@@ -3045,6 +4993,18 @@ def handle_panic(session: Session, word: str) -> bool:
 # --- REPL --------------------------------------------------------------------
 
 
+def cue_intent(session: Session, intent: Intent) -> str:
+    """A chat song request: the model's search text, looked up in code."""
+    query = intent.params.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return "I did not catch a song name. Say `cue <song>`."
+    mode = intent.params.get("mode")
+    after = intent.params.get("after")
+    after = after if isinstance(after, int) and not isinstance(after, bool) else 0
+    return session.cue_song(query, mode if isinstance(mode, str) else "next",
+                            max(0, min(after, 50)))
+
+
 def apply_intent(session: Session, intent: Intent) -> None:
     """Turn a parsed intent into scheduled commands, printing what happens."""
     action = intent.action
@@ -3077,11 +5037,19 @@ def apply_intent(session: Session, intent: Intent) -> None:
         print(session.set_set_phase(str(intent.params.get("phase", ""))))
         return
 
+    if action == "cue_track":
+        print(cue_intent(session, intent))
+        return
+
     if action in ("next_track", "set_energy"):
         direction = intent.energy_direction
         # Remembered so the transition designer knows which way the operator
         # wants the set to go, not just which track to play next.
         session.energy_direction = direction
+        # The room hears it now, not a track from now.
+        now = session.energy_correction(direction)
+        if now:
+            print(now)
         if action == "set_energy" and session.has_cued_track():
             # Re-cue: the queued choice was made under the old direction.
             session.scheduler.cancel_matching(lambda c: isinstance(c, LoadTrack))
@@ -3106,11 +5074,54 @@ def apply_intent(session: Session, intent: Intent) -> None:
 #: the automation is doing the wrong thing, so routing them through the thing
 #: that is doing the wrong thing would be a poor design.
 OVERRIDE_WORDS = {
-    "freeze", "hold", "resume", "unfreeze", "go", "now", "force", "cue",
+    "freeze", "hold", "resume", "unfreeze", "go", "now", "force", "cue", "transitions",
+    "suggest", "queue", "bridge", "plan", "persona",
+    # Back out of the blend in flight (Phase 2.1).
+    "cancel",
+    # The action language (Phase 2.3): `act <request>` or `act {json plan}`.
+    "act",
     # `hotcue` is a stored marker in a track; `cue` above is the headphone
     # output. Two different things, two different words, deliberately.
     "hotcue", "style",
+    # Where to take the tempo: `tempo 128`, or `tempo off` to stop steering it.
+    "tempo",
+    # Phase 4: `feedback <label>` and the stable model (`model learn|rollback`).
+    "feedback", "model",
 }
+
+
+def _handle_tempo(session: Session, rest: str) -> str:
+    """`tempo 128` aims the set at 128 BPM; `tempo off` stops steering it.
+
+    The journey rides toward the target across tracks rather than jumping: a
+    set at 100 reaches 128 over several mixes, each one blendable, which is
+    the whole point of the planner.
+    """
+    text = (rest or "").strip().lower()
+    if not text or text in ("?", "what"):
+        if session.tempo_target:
+            return f"Heading for {session.tempo_target:.0f} BPM."
+        return "No tempo target; say `tempo 128` to set one."
+    if text in ("off", "none", "stop", "clear"):
+        session.tempo_target = None
+        session.session_log.write(
+            "tempo_target", trigger="operator", action="no tempo target",
+        )
+        return "Tempo target cleared."
+    try:
+        target = float(text.split()[0])
+    except (TypeError, ValueError):
+        return f"Say `tempo 128`, not `tempo {text}`."
+    if not 60.0 <= target <= 200.0:
+        return f"{target:.0f} BPM is outside 60-200."
+    session.tempo_target = target
+    now = session.engine.master_bpm
+    session.session_log.write(
+        "tempo_target",
+        trigger=f"operator: {target:.1f} BPM",
+        action=f"riding from {now:.1f} BPM toward {target:.1f} across the set",
+    )
+    return f"Heading for {target:.0f} BPM, a track at a time (now {now:.0f})."
 
 
 def handle_override(session: Session, text: str) -> str | None:
@@ -3125,10 +5136,39 @@ def handle_override(session: Session, text: str) -> str | None:
     word = parts[0].lower()
     rest = parts[1].strip() if len(parts) > 1 else ""
 
+    # "That worked", "too early", "more like this": the operator's word on
+    # what just happened, matched on the whole line before the model sees it.
+    from djai import feedback as feedback_mod
+
+    label = feedback_mod.parse_phrase(text)
+    if label is not None:
+        return session.record_feedback(label)
+    if word == "feedback":
+        label = rest.lower().replace(" ", "_").replace("'", "")
+        if label not in feedback_mod.VERDICTS:
+            return "Say `feedback` with one of: " + ", ".join(feedback_mod.VERDICTS) + "."
+        return session.record_feedback(label)
+    if word == "model":
+        return session.model_text(rest.lower())
+
     if word in ("freeze", "hold") and not rest:
         return session.freeze(True)
     if word in ("resume", "unfreeze") and not rest:
         return session.freeze(False)
+    if word == "cancel" and not rest:
+        return session.cancel_transition()
+    if word == "act":
+        if not rest:
+            return "Say `act <request>` or `act {json plan}`."
+        return actions_mod.act(session, rest, session.intent_engine).summary()
+    if word in ("explain", "why") and not rest:
+        return session.explain()
+    if word == "mode":
+        return session.set_mode(rest.lower())
+    if word in ("mc", "mic"):
+        if rest.lower() not in ("", "on", "off"):
+            return "Say `mc on` or `mc off`."
+        return session.set_mc(rest.lower() == "on" if rest else not session.mc)
     if word in ("go", "now") and not rest:
         return session.force_transition()
     if word == "force":
@@ -3141,11 +5181,43 @@ def handle_override(session: Session, text: str) -> str | None:
             return session.set_cue(None)
         if target in ("a", "b"):
             return session.set_cue(target)
-        return "Say `cue a`, `cue b`, or `cue off`."
+        query, mode, after = _parse_cue_request(rest)
+        return session.cue_song(query, mode, after)
+    if word == "suggest":
+        n = int(rest) if rest.isdigit() else 5
+        rows = session.suggest(n)
+        if not rows:
+            return "Nothing to suggest: every eligible track has played."
+        return "\n".join(r.line() for r in rows)
+    if word == "queue":
+        return _handle_queue(session, rest)
+    if word == "bridge":
+        return session.resolve_bridge(rest.lower())
+    if word == "plan":
+        if rest:
+            try:
+                session.set_minutes = max(10.0, min(480.0, float(rest)))
+            except ValueError:
+                return "Say `plan` or `plan <minutes>`."
+        plan = session.replan("planned" if session.set_plan is None else "operator asked")
+        return plan.summary() if plan else "No plan."
+    if word == "persona":
+        if not rest:
+            return f"Persona: {session.persona}. Choose from {', '.join(planner.PERSONAS)}."
+        return session.set_persona(rest.lower())
     if word == "hotcue":
         return _handle_hotcue(session, rest)
+    if word == "tempo":
+        return _handle_tempo(session, rest)
     if word == "style":
         return _handle_style(session, rest)
+    if word == "transitions":
+        mode = rest.lower()
+        if mode not in transition.MODES + ("auto",):
+            return (f"Transitions are {session.transition_mode}. "
+                    "Say `transitions invisible`, `showy` or `auto`.")
+        session.transition_mode = mode
+        return f"Transitions: {mode}."
     if word == "grid":
         return _handle_grid(session, rest)
     if word in ("loop", "roll", "jump", "pitch", "sync", "quantize"):
@@ -3164,6 +5236,38 @@ def handle_override(session: Session, text: str) -> str | None:
     if word == "filter":
         return _handle_filter(session, rest)
     return None
+
+
+_CUE_MODE_RE = re.compile(
+    r"\s+(?:(?P<now>now|play now)|(?P<next>next|play next)|"
+    r"after\s+(?P<n>\d+)(?:\s+tracks?)?)\s*$", re.IGNORECASE)
+
+
+def _parse_cue_request(text: str) -> tuple[str, str, int]:
+    """``<query> [next|now|after N]`` -> (query, mode, after)."""
+    m = _CUE_MODE_RE.search(" " + text)
+    if not m:
+        return text.strip(), "next", 0
+    query = (" " + text)[: m.start()].strip()
+    if m.group("now"):
+        return query, "now", 0
+    if m.group("n"):
+        return query, "after", int(m.group("n"))
+    return query, "next", 0
+
+
+def _handle_queue(session: Session, rest: str) -> str:
+    parts = rest.split()
+    if not parts:
+        return session.queue_text()
+    try:
+        if parts[0] == "remove" and len(parts) == 2:
+            return session.queue_remove(int(parts[1]))
+        if parts[0] == "move" and len(parts) == 3:
+            return session.queue_move(int(parts[1]), int(parts[2]))
+    except ValueError:
+        pass
+    return "Say `queue`, `queue remove <n>` or `queue move <from> <to>`."
 
 
 def _bars_text(bars: float) -> str:
@@ -3483,6 +5587,83 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         f"{analyzed} analyzed, {skipped} already cached "
         f"({time.time() - started:.1f}s)"
     )
+    return 0
+
+
+def cmd_annotate(args: argparse.Namespace) -> int:
+    """Measure agreement with a person's structure annotations (SPEC §2).
+
+    One JSON file per track in the folder: ``{"track": <title or id>,
+    "sections": [{"label", "start_bar", "end_bar"}, ...], "vocal_bars":
+    [[start, end], ...]}``, bars counted from the first downbeat, ends
+    exclusive. Agreement is always measured first, against what analysis
+    produced; ``--apply`` then records the annotations as authoritative
+    corrections, which re-analysis never overwrites.
+    """
+    folder = Path(args.folder)
+    files = sorted(folder.glob("*.json")) if folder.is_dir() else []
+    if not files:
+        print(f"No annotation files (*.json) in {folder}", file=sys.stderr)
+        return 1
+    cache = Path(args.cache)
+    crate = an.load_crate(cache)
+    reports: list[dict] = []
+    for f in files:
+        try:
+            ann = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"{f.name}: unreadable ({exc})")
+            continue
+        needle = str(ann.get("track") or f.stem)
+        ta = _resolve_track(crate, needle)
+        if ta is None:
+            print(f"{f.name}: no cached track matches {needle!r}")
+            continue
+        reason = understanding.validate_structure(ann.get("sections"), ann.get("vocal_bars"))
+        if reason is not None:
+            print(f"{f.name}: {reason}")
+            continue
+        report = understanding.structure_agreement(ta, ann)
+        report["already_corrected"] = bool(ta.structure_manually_corrected)
+        reports.append(report)
+
+        def pct(key: str) -> str:
+            v = report.get(key)
+            return "  n/a" if v is None else f"{v:5.0%}"
+
+        print(
+            f"{ta.title[:40]:40}  labels {pct('label_accuracy')}  "
+            f"bounds found {pct('boundary_recall')} real {pct('boundary_precision')}  "
+            f"vocals P {pct('vocal_precision')} R {pct('vocal_recall')}"
+            + ("  (already corrected: compares with itself)" if report["already_corrected"] else "")
+        )
+        for d in report["label_disagreements"]:
+            print(f"    bars {d['start_bar']}-{d['end_bar']}: ours {d['ours']}, yours {d['theirs']}")
+        if report["missed_boundaries"] or report["false_boundaries"]:
+            print(
+                f"    missed boundaries {report['missed_boundaries']}, "
+                f"false {report['false_boundaries']}"
+            )
+        if args.apply:
+            understanding.correct_structure(
+                ta, ann.get("sections"), ann.get("vocal_bars") if "vocal_bars" in ann else None
+            )
+            an.write_sidecar(ta, cache)
+
+    fresh = [r for r in reports if not r["already_corrected"]]
+    bars = sum(r["bars_compared"] for r in fresh)
+    agree = sum(r["bars_compared"] * (r["label_accuracy"] or 0.0) for r in fresh)
+    few = " (SPEC §2 asks for 10 or more)" if len(fresh) < 10 else ""
+    if bars:
+        print(f"\n{len(fresh)} track(s) compared{few}; "
+              f"bar-label accuracy {agree / bars:.1%} over {bars} bars")
+    else:
+        print(f"\n{len(fresh)} track(s) compared{few}; no overlapping bars to score")
+    if args.apply:
+        print(f"Recorded {len(reports)} annotation(s) as manual structure corrections.")
+    if args.report:
+        Path(args.report).write_text(json.dumps(reports, indent=2), encoding="utf-8")
+        print(f"Report written to {args.report}")
     return 0
 
 
@@ -3873,6 +6054,13 @@ def cmd_play(args: argparse.Namespace) -> int:
     )
     # Used only to design transitions during the pre-roll, on its own thread.
     session.intent_engine = intent_engine
+    # Crash-safe set state (Phase 3.2/3.3): a killed set resumes here.
+    print(session.attach_set_state(Path(args.logs) / "set_state.json"))
+    # SPEC §6: the set is planned and critic-scored, and both are logged,
+    # before anything plays.
+    plan = session.replan("planned")
+    if plan is not None:
+        print(plan.summary())
     try:
         session.start()
     except Exception as exc:
@@ -3964,6 +6152,19 @@ def build_parser() -> argparse.ArgumentParser:
              "(beat_this), or the original librosa detector",
     )
     p_analyze.set_defaults(func=cmd_analyze)
+
+    p_annotate = sub.add_parser(
+        "annotate",
+        help="compare analysed structure with your annotations; --apply keeps them",
+    )
+    p_annotate.add_argument("folder", help="folder of per-track annotation .json files")
+    p_annotate.add_argument("--cache", default=str(DEFAULT_CACHE_DIR))
+    p_annotate.add_argument(
+        "--apply", action="store_true",
+        help="after reporting, record the annotations as manual corrections",
+    )
+    p_annotate.add_argument("--report", help="also write the full report as JSON here")
+    p_annotate.set_defaults(func=cmd_annotate)
 
     p_play = sub.add_parser("play", help="start the engine and the REPL")
     p_play.add_argument("--cache", default=str(DEFAULT_CACHE_DIR))

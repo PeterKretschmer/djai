@@ -138,6 +138,11 @@ def test_the_echo_delay_is_beat_synced():
 
 def _start(session, style, total_frames):
     engine = session.engine
+    if engine.transition_active:
+        # A fresh blend. The engine never restarts one part-way (Phase 2.3:
+        # a second start landing in a running blend was a click), so a test
+        # that wants a new one ends the old one first.
+        engine._end_transition()
     engine.arm_transition_plan(style, total_frames, 125.0)
     engine.submit(
         StartTransition(

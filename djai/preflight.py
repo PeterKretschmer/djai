@@ -151,33 +151,56 @@ def check_grid(
     if not crate:
         return Check("grid", False, "no tracks to check")
 
+    def listing(tracks: list[TrackAnalysis]) -> str:
+        # Every track, by name, path and confidence. No truncation: at 9pm the
+        # useful output is the list you can act on, and "and 2 more" hides
+        # exactly the track that will derail the set.
+        return "".join(
+            f"\n    {t.grid_confidence:.2f}  {t.title}\n          {t.path}"
+            for t in tracks
+        )
+
     weak = sorted(
         (t for t in crate if t.grid_confidence < threshold),
         key=lambda t: t.grid_confidence,
     )
-    if weak:
-        worst = ", ".join(f"{t.title} ({t.grid_confidence:.2f})" for t in weak[:3])
+    # A weak grid nobody has vouched for is quarantined, not a failure: the
+    # system will not choose the track itself, and a person can still play and
+    # cue it deliberately. What fails preflight is a weak grid that is *not*
+    # quarantined -- one a person has corrected, whose stored confidence no
+    # longer describes the grid in the cache.
+    quarantined = [t for t in weak if t.quarantined]
+    unguarded = [t for t in weak if not t.quarantined]
+    if unguarded:
         return Check(
             "grid", False,
-            f"{len(weak)} of {len(crate)} track(s) below grid confidence "
-            f"{threshold:.2f}: {worst}"
-            + (f" and {len(weak) - 3} more" if len(weak) > 3 else ""),
+            f"{len(unguarded)} of {len(crate)} track(s) below grid confidence "
+            f"{threshold:.2f} and not quarantined:{listing(unguarded)}",
         )
 
-    lowest = min(crate, key=lambda t: t.grid_confidence)
+    selectable = [t for t in crate if not t.quarantined]
+    lowest = min(selectable, key=lambda t: t.grid_confidence) if selectable else None
     warnings = []
+    if quarantined:
+        warnings.append(
+            f"{len(quarantined)} track(s) quarantined below grid confidence "
+            f"{threshold:.2f}: excluded from autonomous selection, still "
+            f"playable and cueable by hand. Correcting a grid clears it."
+            f"{listing(quarantined)}"
+        )
     estimated = [t for t in crate if getattr(t, "mix_points_estimated", False)]
     if estimated:
         warnings.append(
             f"{len(estimated)} track(s) have estimated rather than detected mix "
             f"points; their transitions are placed on a guess"
         )
-    return Check(
-        "grid", True,
-        f"all {len(crate)} track(s) at or above {threshold:.2f} "
-        f"(lowest {lowest.grid_confidence:.2f}, {lowest.title})",
-        warnings,
+    detail = (
+        f"{len(selectable)} of {len(crate)} track(s) selectable at or above "
+        f"{threshold:.2f}"
+        + (f" (lowest {lowest.grid_confidence:.2f}, {lowest.title})" if lowest else "")
+        + (f"; {len(quarantined)} quarantined" if quarantined else "")
     )
+    return Check("grid", bool(selectable), detail, warnings)
 
 
 def check_decode(

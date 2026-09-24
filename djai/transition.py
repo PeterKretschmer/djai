@@ -1221,6 +1221,14 @@ def choose_transition(deck_a, track_b, context=None) -> TransitionChoice:
 
     bpm_a = float(track_a.bpm) * float(getattr(deck_a, "rate", 1.0) or 1.0)
     delta = abs(float(track_b.bpm) - bpm_a) / bpm_a if bpm_a > 0 else 1.0
+    # The planner may already have a way to meet this tempo -- riding the
+    # playing deck toward it, or counting the incoming track half or double --
+    # in which case it says what is actually left to bridge. Without this a
+    # half-time pair reads as 50% apart and a ride that has not finished yet
+    # reads as the gap it was planned to close. See djai.selector.tempo_path.
+    planned = context.get("bpm_delta")
+    if isinstance(planned, (int, float)):
+        delta = abs(float(planned))
     if delta > MAX_BPM_DELTA:
         return TransitionChoice(
             "cut", entry, cue_index,
@@ -1252,3 +1260,267 @@ def choose_transition(deck_a, track_b, context=None) -> TransitionChoice:
     return TransitionChoice(
         "bass_swap", entry, cue_index, f"default{entry_rule}"
     )
+
+
+# =============================================================================
+# Contextual generation (SPEC §4)
+# =============================================================================
+#
+# The presets above are thirteen points in the parameter space. A set built
+# only from them repeats itself within the hour. `generate_transition` builds
+# a transition for the PAIR in front of it: which family suits the context
+# (key clash, tempo residual, energy direction, mix-point quality, outro), then
+# the family's fields set from that context and varied inside the schema's
+# ranges by a seeded RNG. Same inputs and same seed, same transition.
+#
+# It is a heuristic. The weights below were set by hand against the rules
+# `choose_transition` already encodes; no model was trained. The critic
+# (djai.critic) still gets the last word in the pre-roll, and the supervisor
+# vets every candidate before one is returned.
+
+#: The two modes. Invisible: long, effect-free blends the room should not
+#: notice. Showy: short, effect-led gestures it should.
+MODES: tuple[str, ...] = ("invisible", "showy")
+
+#: Families, each a region of the parameter space, and the mode it belongs to.
+FAMILIES: dict[str, str] = {
+    "blend": "invisible",
+    "long_blend": "invisible",
+    "filter_blend": "invisible",
+    "lp_blend": "invisible",
+    "echo_out": "showy",
+    "filter_echo": "showy",
+    "loop_roll": "showy",
+    "riser": "showy",
+    "reverb_out": "showy",
+    "beat_repeat": "showy",
+    "backspin": "showy",
+    "brake": "showy",
+    "double_drop": "showy",
+}
+
+#: A shape may not come back within this many transitions. At ~3.5 minutes a
+#: track, that is about a quarter of an hour of set.
+DIVERSITY_WINDOW: int = 4
+#: Softer penalty for the same FAMILY in that window: a different curve or
+#: length is a different shape, but it is still the same idea.
+FAMILY_REPEAT_PENALTY: float = 0.6
+#: Candidates drawn per call. Enough that every family appears several times.
+GENERATE_CANDIDATES: int = 24
+
+
+@dataclass(frozen=True)
+class PairContext:
+    """What generation knows about the pair. All numbers, no audio."""
+
+    #: The rule-based style for this pair, from `choose_transition`.
+    base_style: str = "bass_swap"
+    #: Tempo left to bridge after the deck has stretched, as a fraction.
+    bpm_residual: float = 0.0
+    #: Incoming energy over outgoing energy, minus one.
+    energy_delta: float = 0.0
+    keys_compatible: bool = True
+    #: Best mix-out quality of A times best mix-in quality of B, 0..1, or None.
+    mix_quality: float | None = None
+    #: Deck A in its outro with falling energy.
+    outro_falling: bool = False
+    #: Both tracks carry a drop cue, so a drop-aligned family can run.
+    drops: bool = False
+
+
+class Generated(NamedTuple):
+    params: TransitionParams
+    shape: str
+    score: float
+    rule: str
+
+
+def shape_signature(p: TransitionParams) -> str:
+    """What makes two transitions sound like the same move.
+
+    Family, fader curve, length bucket and which effects are on. Intensity and
+    exact bar positions are deliberately not in it: a 0.62 and a 0.66 filter
+    sweep are the same move to a listener.
+    """
+    family = p.name[4:] if p.name.startswith("gen_") else p.name
+    length = "short" if p.length_bars <= 8 else ("mid" if p.length_bars <= 16 else "long")
+    fx = [
+        name for name, on in (
+            ("echo", p.echo_bars > 0), ("reverb", p.reverb_bars > 0),
+            ("riser", p.riser_bars > 0), ("loop", p.loop_out_bars > 0),
+            ("repeat", p.beat_repeat_division > 0), ("spin", p.backspin_bars > 0),
+            ("brake", p.brake_beats > 0), ("dd", p.double_drop_bars > 0),
+            (p.filter_sweep, p.filter_sweep != "none"),
+            ("roll", p.deck_a_high_rolloff),
+        ) if on
+    ]
+    return f"{family}/{p.curve}/{length}/{'+'.join(fx) or 'dry'}"
+
+
+def _family_fit(family: str, ctx: PairContext) -> tuple[float, str]:
+    """How well a family suits this pair, and why. Hand-set weights."""
+    q = 0.6 if ctx.mix_quality is None else ctx.mix_quality
+    rising = ctx.energy_delta > ENERGY_RISE - 1.0
+    falling = ctx.energy_delta < -(ENERGY_RISE - 1.0) or ctx.outro_falling
+    fit, why = 1.0, []
+    if family in ("blend", "long_blend", "lp_blend"):
+        if not ctx.keys_compatible:
+            fit -= 1.0
+            why.append("keys clash under a long overlap")
+        if ctx.bpm_residual > CLOSE_BPM_DELTA:
+            fit -= 0.8
+            why.append("tempo residual over a long overlap")
+        fit += 0.6 * (q - 0.5)
+        why.append(f"mix-point quality {q:.2f}")
+        if family == "long_blend" and q < 0.6:
+            fit -= 0.5
+    if family in ("filter_blend", "filter_echo") and not ctx.keys_compatible:
+        fit += 0.6
+        why.append("filter hides the key clash")
+    if family in ("echo_out", "reverb_out", "filter_echo", "brake") and falling:
+        fit += 0.7
+        why.append("energy falling or outro")
+    if family in ("riser", "loop_roll", "beat_repeat", "backspin") and rising:
+        fit += 0.7
+        why.append("energy rising")
+    if family in ("echo_out", "reverb_out", "brake", "backspin", "beat_repeat") and q < 0.4:
+        fit += 0.4
+        why.append("weak mix point, short gesture")
+    if family == "double_drop":
+        if not ctx.drops:
+            return -9.0, "no drop cues to line up"
+        fit += 0.5 if rising else -0.3
+    base = {"bass_swap": "blend", "filter_sweep": "filter_blend",
+            "echo_out": "echo_out"}.get(ctx.base_style)
+    if base == family:
+        fit += 0.3
+        why.append(f"rule-based choice is {ctx.base_style}")
+    return fit, ", ".join(why) or "neutral"
+
+
+def _build_family(family: str, ctx: PairContext, rng) -> TransitionParams:
+    """One point in the family's region, set from context and varied by rng."""
+    q = 0.6 if ctx.mix_quality is None else ctx.mix_quality
+
+    def jitter(x: float, d: float) -> float:
+        return round(_clamp01(x + rng.uniform(-d, d)), 3)
+
+    name = f"gen_{family}"
+    if family in ("blend", "long_blend", "lp_blend", "filter_blend"):
+        if family == "long_blend":
+            length = 32.0
+        else:
+            # A good mix point earns a longer overlap.
+            length = rng.choice((16.0, 24.0) if q >= 0.5 else (8.0, 16.0))
+        curve = rng.choice(
+            ("equal_power", "slow_in") if family == "lp_blend"
+            else ("equal_power", "s_curve", "linear")
+        )
+        swap = int(length * rng.choice((0.5, 0.5, 0.625, 0.75)))
+        return TransitionParams(
+            length_bars=length, curve=curve,
+            low_swap_bar=min(swap, int(length) - 1),
+            low_swap_bars=rng.choice((1, 1, 2)),
+            deck_a_high_rolloff=family != "filter_blend" and rng.random() < 0.4,
+            filter_sweep={"filter_blend": "hp_out", "lp_blend": "lp_in"}.get(family, "none"),
+            filter_resonance=jitter(0.15, 0.1),
+            intensity=jitter(0.5, 0.15),
+            name=name,
+        )
+    if family == "echo_out":
+        return TransitionParams(
+            length_bars=4.0, curve="fast_in", low_swap_bar=2,
+            echo_bars=rng.choice((2, 4)), intensity=jitter(0.8, 0.1), name=name,
+        )
+    if family == "filter_echo":
+        return TransitionParams(
+            length_bars=rng.choice((8.0, 12.0)), curve="s_curve",
+            filter_sweep="hp_out", filter_resonance=jitter(0.4, 0.15),
+            echo_bars=2, intensity=jitter(0.85, 0.1), name=name,
+        )
+    if family == "loop_roll":
+        return TransitionParams(
+            length_bars=8.0, curve="fast_in", loop_out_bars=rng.choice((2.0, 4.0)),
+            loop_halving=True, intensity=jitter(0.9, 0.08), name=name,
+        )
+    if family == "riser":
+        bars = rng.choice((4, 6, 8))
+        return TransitionParams(
+            length_bars=float(bars), curve="slow_in", low_swap_bar=bars - 1,
+            riser_bars=bars, deck_a_high_rolloff=rng.random() < 0.5,
+            intensity=jitter(0.85, 0.1), name=name,
+        )
+    if family == "reverb_out":
+        return TransitionParams(
+            length_bars=rng.choice((4.0, 8.0)), curve="fast_in", low_swap_bar=2,
+            echo_bars=rng.choice((0, 2)), reverb_bars=2,
+            intensity=jitter(0.8, 0.1), name=name,
+        )
+    if family == "beat_repeat":
+        return TransitionParams(
+            length_bars=4.0, curve="fast_in",
+            beat_repeat_division=rng.choice((8, 16)),
+            intensity=jitter(0.9, 0.08), name=name,
+        )
+    if family == "backspin":
+        return TransitionParams(
+            length_bars=4.0, curve="fast_in", backspin_bars=rng.choice((0.5, 1.0)),
+            intensity=jitter(0.9, 0.08), name=name,
+        )
+    if family == "brake":
+        return TransitionParams(
+            length_bars=4.0, curve="fast_in", low_swap_bar=3,
+            brake_beats=rng.choice((1, 2)), intensity=0.9, name=name,
+        )
+    # double_drop
+    return TransitionParams(
+        length_bars=16.0, curve="equal_power", low_swap_bar=0,
+        double_drop_bars=rng.choice((8.0, 12.0)), align_mode="drop",
+        intensity=jitter(0.8, 0.1), name=name,
+    )
+
+
+def generate_transition(
+    ctx: PairContext,
+    mode: str,
+    seed: int,
+    recent: list[str] | tuple[str, ...] = (),
+    accept=None,
+) -> Generated | None:
+    """Build the transition for this pair. Pure and deterministic in ``seed``.
+
+    ``recent`` is the shape signatures of the last transitions, oldest first.
+    A shape inside the last :data:`DIVERSITY_WINDOW` is never returned while
+    any other candidate is acceptable. ``accept(params) -> (ok, reason)`` is
+    the supervisor's vetting; a candidate it refuses is not returned.
+    Returns None only when every candidate is refused.
+    """
+    import random
+
+    rng = random.Random(seed)
+    window = list(recent)[-DIVERSITY_WINDOW:]
+    recent_families = {s.split("/", 1)[0] for s in window}
+    families = [f for f, m in FAMILIES.items() if mode not in MODES or m == mode]
+    scored: list[tuple[float, int, TransitionParams, str]] = []
+    for i in range(GENERATE_CANDIDATES):
+        family = families[i % len(families)]
+        fit, why = _family_fit(family, ctx)
+        if fit <= -9.0:
+            continue
+        params = _build_family(family, ctx, rng)
+        shape = shape_signature(params)
+        score = fit + rng.uniform(0.0, 0.2)   # seeded tie-break, not taste
+        if shape in window:
+            score -= 100.0                    # never inside the window if avoidable
+            why += "; shape used recently"
+        elif family in recent_families:
+            score -= FAMILY_REPEAT_PENALTY
+            why += "; family used recently"
+        scored.append((score, i, params, why))
+    scored.sort(key=lambda s: (-s[0], s[1]))
+    for score, _i, params, why in scored:
+        if accept is not None and not accept(params)[0]:
+            continue
+        return Generated(params, shape_signature(params), round(score, 3),
+                         f"{mode}: {params.name} ({why})")
+    return None

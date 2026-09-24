@@ -29,6 +29,7 @@ import librosa
 import numpy as np
 
 from djai import beat_tracker, config
+from djai import understanding
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +63,13 @@ log = logging.getLogger(__name__)
 #: breakdown, outro), vocal bar ranges, a loudness-normalised intensity score
 #: and an artist parsed from the file name. v5-v7 upgrade in place with those
 #: empty; `analyze` measures them without touching the tempo or grid.
-ANALYSIS_VERSION = 8
+#: 9 added track understanding (SPEC §2, djai.understanding): a confidence on
+#: each section, ranked mix-in and mix-out regions with their quality
+#: components, a documented embedding, an uncertainty on every derived feature
+#: and `structure_manually_corrected`. v5-v8 upgrade in place: all of it is
+#: derived from stored fields except key and vocal uncertainty, which stay
+#: None until `analyze` next reads the audio.
+ANALYSIS_VERSION = 9
 
 #: Hot cue positions are stored in **deck frames** -- seconds * this rate --
 #: because that is the domain a deck's playhead lives in, and a cue that has to
@@ -257,6 +264,17 @@ class TrackAnalysis:
     #: From an "Artist - Title" file name; empty when the name has no artist.
     artist: str = ""
 
+    #: v9 (SPEC §2), all from djai.understanding. Ranked best first, each
+    #: ``{"bar", "seconds", "quality", "components"}``.
+    mix_in_regions: list[dict] = field(default_factory=list)
+    mix_out_regions: list[dict] = field(default_factory=list)
+    #: understanding.EMBEDDING_METHOD, hand-built, not learned.
+    embedding: list[float] = field(default_factory=list)
+    #: 0..1 per derived feature (higher is less sure); None where unmeasured.
+    uncertainty: dict = field(default_factory=dict)
+    #: A person set the sections / vocal bars. Analysis never overwrites them.
+    structure_manually_corrected: bool = False
+
     analysis_version: int = ANALYSIS_VERSION
 
     # Cached numpy views, built lazily. Not serialised.
@@ -295,6 +313,24 @@ class TrackAnalysis:
         return self.tempo_ambiguous or (
             self.grid_confidence < config.TRANSITION_MIN_GRID_CONFIDENCE
         )
+
+    @property
+    def quarantined(self) -> bool:
+        """Is this grid too weak to let the system choose the track itself?
+
+        Quarantine is a derived state, not a stored flag: a track is in it
+        while its measured confidence is under the preflight bar and no person
+        has vouched for the grid. That is what makes it clear itself -- a
+        correction through :func:`regrid` sets ``grid_manually_corrected`` and
+        the track leaves quarantine on the spot, with no confidence value
+        invented for it (``regrid`` has no audio, so it cannot measure one).
+
+        A quarantined track stays fully playable and cueable by hand; only
+        autonomous selection refuses to reach for it.
+        """
+        if self.grid_manually_corrected:
+            return False
+        return self.grid_confidence < config.PREFLIGHT_MIN_GRID_CONFIDENCE
 
     @property
     def vocal_led(self) -> bool:
@@ -444,7 +480,8 @@ ARRAY_FIELDS: tuple[str, ...] = ("beats", "downbeats", "beat_rms")
 #: changed the tempo itself, and no arithmetic on a stale sidecar recovers a
 #: number that came out of the audio. v7 is upgradable for the same reason as
 #: v6: v8 only added fields that start empty.
-UPGRADABLE_FROM: tuple[int, ...] = (5, 6, 7)
+#: v8 is upgradable too: everything v9 adds is derived from stored fields.
+UPGRADABLE_FROM: tuple[int, ...] = (5, 6, 7, 8)
 
 
 def write_sidecar(ta: "TrackAnalysis", cache_dir: Path = DEFAULT_CACHE_DIR) -> Path:
@@ -533,6 +570,7 @@ def upgrade_sidecar(d: dict, path: Path) -> dict | None:
         ta = TrackAnalysis.from_dict(d)
     except TypeError:
         return None
+    understanding.derive(ta)
     in_memory = {k: v for k, v in asdict(ta).items() if not k.startswith("_")}
     if Path(path).stem != ta.track_id:
         # Only entries named by their content hash are rewritten. Anything else
@@ -546,6 +584,27 @@ def upgrade_sidecar(d: dict, path: Path) -> dict | None:
         return in_memory
     reread, status = read_sidecar(written)
     return reread if status == "ok" else None
+
+
+def unusable_reason(ta: "TrackAnalysis") -> str | None:
+    """Why an analysis cannot be mixed from, or None if it can.
+
+    A hand-edited or half-written sidecar can reach the crate with no tempo or
+    no grid; every tempo path and placement divides by those, so a set must
+    set such a track aside rather than reach for it.
+    """
+    try:
+        bpm = float(ta.bpm)
+        duration = float(ta.duration_s)
+    except (TypeError, ValueError):
+        return f"analysis failed: tempo {ta.bpm!r}, duration {ta.duration_s!r}"
+    if not (math.isfinite(bpm) and bpm > 0):
+        return f"analysis failed: no usable tempo ({ta.bpm!r})"
+    if not (math.isfinite(duration) and duration > 0):
+        return f"analysis failed: no usable duration ({ta.duration_s!r})"
+    if len(ta.beats or ()) < 8 or len(ta.downbeats or ()) < 2:
+        return "analysis failed: no beat grid"
+    return None
 
 
 def load_cached(track_id: str, cache_dir: Path = DEFAULT_CACHE_DIR) -> TrackAnalysis | None:
@@ -894,6 +953,34 @@ def _estimate_key(chroma: np.ndarray) -> tuple[str, str]:
     return best
 
 
+def key_uncertainty(chroma: np.ndarray) -> float | None:
+    """0..1: how close the runner-up key came. Heuristic.
+
+    The margin between the best Krumhansl-Schmuckler correlation and the best
+    one that is neither it nor its relative (which shares its Camelot number
+    and mixes the same). A margin of 0.15 or more reads as certain; a track
+    with no pitched content at all is fully uncertain.
+    """
+    profile = chroma.mean(axis=1)
+    if not np.any(profile):
+        return 1.0
+    profile = profile - profile.mean()
+    scores: dict[str, float] = {}
+    for mode, ks in (("major", _KS_MAJOR), ("minor", _KS_MINOR)):
+        ref = ks - ks.mean()
+        table = _CAMELOT_MAJOR if mode == "major" else _CAMELOT_MINOR
+        for tonic in range(12):
+            rotated = np.roll(profile, -tonic)
+            denom = np.linalg.norm(rotated) * np.linalg.norm(ref)
+            score = float(np.dot(rotated, ref) / denom) if denom else 0.0
+            code = table[_PITCH_NAMES[tonic]]
+            scores[code] = max(scores.get(code, -1.0), score)
+    best = max(scores, key=scores.get)
+    others = [v for k, v in scores.items() if k[:-1] != best[:-1]]
+    margin = scores[best] - max(others) if others else 1.0
+    return round(float(min(1.0, max(0.0, 1.0 - margin / 0.15))), 4)
+
+
 def _estimate_downbeats(
     beats: np.ndarray, beat_chroma: np.ndarray, beat_rms: np.ndarray
 ) -> list[float]:
@@ -1162,23 +1249,56 @@ def complete_measurements(ta: "TrackAnalysis", path: Path) -> None:
         ta.track_gain_db = loudness_gain_db(
             ta.lufs, ta.true_peak_dbtp, ta.played_peak_dbtp
         )
+    decoded: list = []
+
+    def audio():
+        """Decode once, however many measurements below need it."""
+        if not decoded:
+            decoded.extend(librosa.load(str(path), sr=ANALYSIS_SR, mono=True))
+        return decoded[0], decoded[1]
+
     if not ta.tempo_scores:
-        y, sr = librosa.load(str(path), sr=ANALYSIS_SR, mono=True)
+        y, sr = audio()
         oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=_HOP)
         ta.tempo_scores = tempo_candidates(oenv, sr, ta.bpm)
         ta.tempo_ambiguous = (
             False if ta.grid_manually_corrected
             else tempo_ambiguity(ta.bpm, ta.tempo_scores)
         )
-    if ta.intensity is None:
+    unc = dict(ta.uncertainty or {})
+    if unc.get("key") is None:
+        # v9: key uncertainty needs the chroma, which no sidecar keeps.
         try:
-            y, sr = librosa.load(str(path), sr=ANALYSIS_SR, mono=True)
+            y, sr = audio()
+            chroma = librosa.feature.chroma_cqt(
+                y=librosa.effects.harmonic(y, margin=3.0), sr=sr, hop_length=_HOP,
+                fmin=librosa.note_to_hz(_CHROMA_FMIN_NOTE), n_octaves=_CHROMA_OCTAVES,
+            )
+            ta.uncertainty = {**(ta.uncertainty or {}), "key": key_uncertainty(chroma)}
+        except Exception as exc:
+            log.warning("key uncertainty measurement failed for %s: %s", path, exc)
+    if ta.intensity is None or (
+        unc.get("vocals") is None and not ta.structure_manually_corrected
+    ):
+        # Structure is deterministic for a given grid, so re-measuring it for
+        # the vocal uncertainty reproduces the stored sections.
+        kept = (ta.sections, ta.vocal_bars, ta.vocal_fraction)
+        try:
+            y, sr = audio()
             measure_structure(ta, y, sr)
         except Exception as exc:  # an entry without structure still plays
             log.warning("structure measurement failed for %s: %s", path, exc)
-            ta.intensity = float("nan")
+            if ta.intensity is None:
+                ta.intensity = float("nan")
+            # Measured and failed: fully uncertain, and not retried every run.
+            ta.uncertainty = {**(ta.uncertainty or {}), "vocals": 1.0}
+        if ta.structure_manually_corrected:
+            # Intensity was missing, not the structure: a person's sections
+            # and vocals stand.
+            ta.sections, ta.vocal_bars, ta.vocal_fraction = kept
     if not ta.artist:
         ta.artist = artist_from_title(ta.title)
+    understanding.derive(ta)
 
 
 # --- musical structure: sections, vocals, intensity ---------------------------
@@ -1395,7 +1515,16 @@ def measure_structure(ta: "TrackAnalysis", y: np.ndarray, sr: int) -> None:
     flux = np.sqrt((np.maximum(delta, 0.0) ** 2).sum(axis=0)) / (
         np.sqrt((Hb ** 2).sum(axis=0)) + eps
     )
-    flags = (per_bar(flux)[0] > VOCAL_FLUX_MIN) & (per_bar(share)[0] > VOCAL_SHARE_MIN)
+    bar_flux, bar_share = per_bar(flux)[0], per_bar(share)[0]
+    flags = (bar_flux > VOCAL_FLUX_MIN) & (bar_share > VOCAL_SHARE_MIN)
+    # Uncertainty: the share of bars within 25% of either threshold, where the
+    # call could have gone the other way. Thresholds were set on synthetic
+    # voices (BLOCKERS.md), so this is a floor on the real uncertainty.
+    near = (np.abs(bar_flux / VOCAL_FLUX_MIN - 1.0) < 0.25) | (
+        np.abs(bar_share / VOCAL_SHARE_MIN - 1.0) < 0.25
+    )
+    ta.uncertainty = dict(ta.uncertainty or {})
+    ta.uncertainty["vocals"] = round(float(near.mean()), 4) if near.size else 1.0
     ta.vocal_bars = _runs(flags, bar0)
     ta.vocal_fraction = round(
         sum(b - a for a, b in ta.vocal_bars) / max(1, flags.size), 4
@@ -1635,6 +1764,7 @@ def analyze_file(
         beat_chroma = np.pad(beat_chroma, ((0, 0), (0, beats.size - beat_chroma.shape[1])))
 
     key_name, camelot = _estimate_key(chroma)
+    key_unc = key_uncertainty(chroma)
     downbeats = _estimate_downbeats(beats, beat_chroma, beat_rms)
     bar_line = grid[1] if grid is not None else fitted[1] if fitted is not None else None
     if bar_line is not None:
@@ -1696,11 +1826,13 @@ def analyze_file(
         grid_manually_corrected=grid is not None,
         artist=artist_from_title(path.stem),
     ))
+    ta.uncertainty = {"key": key_unc}
     try:
         measure_structure(ta, y, sr)
     except Exception as exc:  # a track without structure still plays
         log.warning("structure measurement failed for %s: %s", path, exc)
         ta.intensity = float("nan")
+    understanding.derive(ta)
     return ta
 
 
@@ -1751,6 +1883,11 @@ def analyze_folder(
                     or cached.played_peak_dbtp is None
                     or not cached.tempo_scores
                     or cached.intensity is None
+                    or cached.uncertainty.get("key") is None
+                    or (
+                        cached.uncertainty.get("vocals") is None
+                        and not cached.structure_manually_corrected
+                    )
                 ):
                     # Upgraded from an older schema: measure what it lacks,
                     # keeping its tempo and grid exactly as they are.
@@ -1776,6 +1913,12 @@ def analyze_folder(
                     ta.grid_confidence = IMPORTED_GRID_CONFIDENCE
             else:
                 ta = analyze_file(p)
+            if previous is not None and previous.structure_manually_corrected:
+                # The same rule for a person's structure: carried forward,
+                # never re-measured over.
+                understanding.correct_structure(
+                    ta, previous.sections, previous.vocal_bars
+                )
         except Exception as exc:  # a bad file must not abort the whole crate
             log.error("analysis failed for %s: %s", p, exc)
             print(f"[{i}/{len(files)}] FAILED   {p.name}: {exc}")

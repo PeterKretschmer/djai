@@ -175,7 +175,8 @@ def test_only_the_storage_only_schema_change_is_brought_forward(tmp_path, capsys
     import json
 
     # v7 is upgradable too: v8 only added structure fields that start empty.
-    assert analysis.UPGRADABLE_FROM == (5, 6, 7), "only the schema changes that re-measure nothing upgrade"
+    # v8 too: v9 only added fields derived from what v8 already stores.
+    assert analysis.UPGRADABLE_FROM == (5, 6, 7, 8), "only the schema changes that re-measure nothing upgrade"
 
     audio = tmp_path / "old.wav"
     audio.write_bytes(b"placeholder")

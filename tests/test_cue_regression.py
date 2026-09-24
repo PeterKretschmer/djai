@@ -127,8 +127,12 @@ def test_a_live_deck_that_ran_out_is_not_restarted_over_the_playing_one(idle_ses
 
 
 def test_no_compatible_track_is_logged_loudly_and_not_flooded(session, monkeypatch, caplog):
-    # Both selectors: since Phase 2, an empty ranking falls back to the nearest
-    # tempo and a cut, so "nothing at all" is what this path now means.
+    # Every way in: since Phase 2 an empty ranking falls back to the nearest
+    # tempo and a cut, and since Phase 4 the cue starts from a journey. This
+    # path is what is left when selection offers nothing at all.
+    from djai.selector import Journey
+
+    monkeypatch.setattr(cli, "plan_journey", lambda *a, **k: Journey(steps=(), score=0.0))
     monkeypatch.setattr(cli, "select_next", lambda *a, **k: None)
     monkeypatch.setattr(cli, "select_nearest_tempo", lambda *a, **k: None)
     notices: list[str] = []

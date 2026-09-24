@@ -129,6 +129,8 @@ class UIServer:
         #: autopilot is frozen, so operator and automation can never be
         #: steering the same deck at the same time.
         self._held: bool = False
+        #: The last typed line nothing understood, shown until the next one.
+        self._parse_failure: dict | None = None
         #: Per deck: a load that is waiting for the next phrase boundary, so
         #: the UI can say "loads at next phrase" instead of looking ignored.
         self._pending: dict[str, dict[str, Any]] = {}
@@ -431,6 +433,21 @@ class UIServer:
             "forced_next": (
                 session._forced_next.title if session._forced_next else None
             ),
+            # Phase 3.2: the operator's cue queue, and ranked suggestions with
+            # their reasons. Cueing one is `/override/cue?arg=<track_id>`.
+            "cue_queue": [dict(e) for e in session.cue_queue],
+            "suggestions": self._suggestions(),
+            # SPEC §6: the upcoming plan, as titles, with its critic score.
+            "plan": (
+                {
+                    "persona": session.set_plan.persona,
+                    "score": session.set_plan.critique.get("score"),
+                    "reason": session.set_plan.reason,
+                    "near": [x.track.title for x in session.set_plan.near],
+                    "mid": [x.track.title for x in session.set_plan.mid],
+                }
+                if session.set_plan is not None else None
+            ),
             "cue": {
                 "mode": engine.cue_mode,
                 "deck": engine.cue_deck,
@@ -451,7 +468,31 @@ class UIServer:
                 "reason": session.watchdog.reason if session.watchdog else None,
             },
             "notices": self._drain_notices(),
+            # Phase 5: co-pilot and MC, bar-by-bar energy (a proxy, from the
+            # closed loop's own readings), what autonomous selection will not
+            # touch, and the last line the chat could not understand.
+            "mode": session.mode,
+            "mc": session.mc,
+            "energy_history": (
+                [round(r.energy_db, 1) for r in list(session.room.master.readings)]
+                if session.room is not None else []
+            ),
+            "quarantined": self._quarantined(),
+            "last_parse_failure": self._parse_failure,
         }
+
+    def _quarantined(self) -> list[dict]:
+        """Quarantined grids and set-aside tracks. Re-read only when they change."""
+        s = self.session
+        key = (len(s.crate), len(s._unplayable),
+               sum(bool(t.grid_manually_corrected) for t in s.crate))
+        if key != getattr(self, "_quarantine_key", None):
+            rows = [{"title": t.title, "why": f"grid {t.grid_confidence:.2f}"}
+                    for t in s.crate if getattr(t, "quarantined", False)]
+            rows += [{"title": t.title, "why": "set aside"}
+                     for t in s.crate if t.track_id in s._unplayable]
+            self._quarantine_rows, self._quarantine_key = rows, key
+        return self._quarantine_rows
 
     def waveform(self, deck_name: str) -> dict[str, Any]:
         """Peaks plus the musical landmarks the canvas draws. Cached per track."""
@@ -591,6 +632,28 @@ class UIServer:
             self.session.after_stop()
             self.hold_automation(True, reason="stop")
         return {"ok": True, "action": action}
+
+    def _suggestions(self) -> list[dict]:
+        """Suggestions, re-ranked only when something they depend on changed.
+
+        Ranking walks the crate with similarity lookups; the UI polls several
+        times a second, and polling must not cost the control thread that.
+        """
+        s = self.session
+        live = s.engine.deck(s.live_deck)
+        key = (
+            live.track.analysis.track_id if live.track is not None else None,
+            len(s.played), len(s.cue_queue), s.set_phase,
+            round(s.energy_direction, 2), s.tempo_target,
+            id(getattr(s, "set_plan", None)),
+        )
+        if key != getattr(self, "_suggest_key", None):
+            try:
+                self._suggest_rows = [r.as_dict() for r in s.suggest(5)]
+            except Exception as exc:  # the panel is advisory; never break state()
+                self._suggest_rows = [{"error": str(exc)}]
+            self._suggest_key = key
+        return self._suggest_rows
 
     def override(self, action: str, arg: str = "") -> dict[str, Any]:
         """Manual override, over plain HTTP like the panic path.
@@ -821,6 +884,27 @@ class UIServer:
         return {"ok": True, "deck": deck_name, "when": when,
                 "title": analysis.title}
 
+    def operator_feedback(self, verdict: str) -> dict[str, Any]:
+        """Record "that worked" / "that didn't" -- or any other label in
+        djai.feedback.VERDICTS -- about what just played.
+
+        Worker thread. The page sends only the label; the Session attaches
+        everything that makes it useful later, the same way the REPL's and the
+        chat box's words do.
+        """
+        from djai import feedback as feedback_mod
+
+        if verdict not in feedback_mod.VERDICTS:
+            return {"ok": False, "error": f"unknown verdict {verdict!r}"}
+        session = self.session
+        try:
+            session.record_feedback(verdict)
+        except Exception as exc:  # noqa: BLE001 - a verdict must not break the UI
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        learning = session.feedback_summary.get("learning", "")
+        session.notify(f"[feedback] {verdict}: {learning}")
+        return {"ok": True, "verdict": verdict, "learning": learning}
+
     def set_transport(self, deck_name: str, playing: bool) -> dict[str, Any]:
         """PLAY / PAUSE one deck, immediately, without touching the other.
 
@@ -928,6 +1012,7 @@ class UIServer:
                 execute_at=IMMEDIATE, origin="ui:eq",
             )
         )
+        self.session.operator_touched(deck_name)
         return {"ok": True, "deck": deck_name}
 
     def apply_filter(
@@ -1155,6 +1240,8 @@ class UIServer:
                 deck, int(msg.get("index", 0)),
                 str(msg.get("op", "jump")), str(msg.get("label", "")),
             )
+        elif kind == "feedback":
+            out = self.operator_feedback(str(msg.get("verdict", "")))
         elif kind == "style":
             out = self.set_style(str(msg.get("style", "auto")))
         elif kind == "phase":
@@ -1193,9 +1280,12 @@ class UIServer:
             return {"type": "reply", "text": reply, "override": True}
 
         if self.intent_engine is None:
+            self._parse_failure = {"text": text, "why": "no local model; keyword commands only",
+                                   "t": time.time()}
             return {
                 "type": "reply",
                 "text": "No local model available; keyword commands only.",
+                "parse_failure": self._parse_failure["why"],
             }
 
         intent = self.intent_engine.interpret(text, self.session.model_state())
@@ -1209,10 +1299,23 @@ class UIServer:
             origin="ui",
             latency_s=round(intent.latency_s, 2),
         )
-        cli.apply_intent(self.session, intent)
+        if intent.action == "cue_track":
+            # What the lookup found, not what the model said it would find:
+            # "no match" and a list of candidates must reach the operator.
+            reply = cli.cue_intent(self.session, intent)
+        else:
+            cli.apply_intent(self.session, intent)
+            reply = intent.reply or f"({intent.action})"
+        failure = None
+        if not intent.ok or intent.action == "none":
+            failure = intent.error or "no action matched"
+            if intent.fallback:
+                failure += f" (model: {intent.fallback})"
+            self._parse_failure = {"text": text, "why": failure, "t": time.time()}
         return {
             "type": "reply",
-            "text": intent.reply or f"({intent.action})",
+            "text": reply,
+            "parse_failure": failure,
             "action": intent.action,
             "fallback": intent.fallback,
             "latency_s": round(intent.latency_s, 2),

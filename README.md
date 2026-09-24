@@ -114,7 +114,7 @@ cut.
 ## Configuration
 
 Everything is optional environment variables — see
-[`.env.example`](.env.example) for all 47 with their defaults, and
+[`.env.example`](.env.example) for all 52 with their defaults, and
 [docs/tuning.md](docs/tuning.md) for what is worth tuning. The ones you are
 most likely to touch:
 

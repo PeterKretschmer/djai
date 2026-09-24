@@ -59,6 +59,10 @@ async function override(action, arg, btn) {
 $("btn-freeze").onclick = (e) =>
   override(state && state.frozen ? "resume" : "freeze", "", e.currentTarget);
 $("btn-go").onclick = (e) => override("go", "", e.currentTarget);
+$("btn-mode").onclick = (e) =>
+  override("mode", state && state.mode === "assisted" ? "autonomous" : "assisted", e.currentTarget);
+$("btn-mc").onclick = (e) => override("mc", state && state.mc ? "off" : "on", e.currentTarget);
+$("btn-why").onclick = (e) => override("explain", "", e.currentTarget);
 $("btn-cue-a").onclick = (e) =>
   override("cue", state && state.cue.deck === "a" ? "off" : "a", e.currentTarget);
 $("btn-cue-b").onclick = (e) =>
@@ -192,6 +196,19 @@ DECKS.forEach(buildPerf);
 
 $("btn-quantize").onclick = () =>
   perform(state ? state.live_deck : "a", "quantize", !(state && state.quantize));
+
+/* The verdict buttons. The server attaches it to the transition that just
+ * played -- the page does not have to know which one that was. */
+for (const [id, verdict] of [["btn-worked", "worked"], ["btn-didnt", "didnt"]]) {
+  $(id).onclick = () => {
+    send({ type: "feedback", verdict });
+    const note = $("feedback-note");
+    if (note) {
+      note.textContent = verdict === "worked" ? "noted: worked" : "noted: didn't";
+      setTimeout(() => { note.textContent = ""; }, 4000);
+    }
+  };
+}
 
 $("style-pick").onchange = (e) => send({ type: "style", style: e.target.value });
 $("phase-pick").onchange = (e) => send({ type: "phase", phase: e.target.value });
@@ -659,7 +676,11 @@ function connect() {
   };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === "reply") { if (msg.text) log(msg.text); return; }
+    if (msg.type === "reply") {
+      if (msg.text) log(msg.text);
+      if (msg.parse_failure) log(`not understood: ${msg.parse_failure}`, "err");
+      return;
+    }
     if (msg.type === "ack") {
       if (!msg.ok) log(msg.error || "rejected", "err");
       return;
@@ -1011,7 +1032,94 @@ function render() {
     }
   }
 
+  renderCues();
+  renderSet();
   draw();
+}
+
+/* ---------------- set panel (Phase 5.2) ------------------- */
+
+const SPARK = "▁▂▃▄▅▆▇█";
+function sparkline(values) {
+  if (!values || !values.length) return "-";
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const span = Math.max(hi - lo, 1e-6);
+  return values.map((v) => SPARK[Math.min(7, Math.floor((v - lo) / span * 8))]).join("");
+}
+function renderSet() {
+  const e = state.energy_history || [];
+  $("energy-spark").textContent = sparkline(e.slice(-48));
+  $("energy-spark").title = e.length ? `last ${e.length} bars, ${Math.min(...e).toFixed(1)} to ${Math.max(...e).toFixed(1)} dB (proxy)` : "";
+  const p = state.plan;
+  $("plan-list").textContent = p ? [...p.near, ...p.mid].join(" > ") || "-" : "no plan";
+  if (p) $("plan-list").title = `${p.persona}, critic ${p.score}: ${p.reason}`;
+  const q = state.quarantined || [];
+  $("quarantine-list").textContent = q.length ? q.map((t) => `${t.title} (${t.why})`).join(", ") : "none";
+  const f = state.last_parse_failure;
+  $("parse-fail").textContent = f ? `not understood: "${f.text}" - ${f.why}` : "";
+  const mode = $("btn-mode");
+  mode.textContent = state.mode === "assisted" ? "CO-PILOT" : "AUTO";
+  mode.classList.toggle("on", state.mode === "assisted");
+  $("btn-mc").classList.toggle("on", !!state.mc);
+}
+
+/* ---------------- cue queue and suggestions (Phase 3.2) ------------------- */
+
+let lastCueKey = "";
+function cueButton(label, title, fn) {
+  const b = document.createElement("button");
+  b.className = "qbtn";
+  b.textContent = label;
+  b.title = title;
+  b.onclick = (e) => fn(e.currentTarget);
+  return b;
+}
+function renderCues() {
+  // Rebuilt only when the data changed, so a button is never replaced under
+  // the pointer between mousedown and click.
+  const key = JSON.stringify([state.cue_queue, state.suggestions]);
+  if (key === lastCueKey) return;
+  lastCueKey = key;
+  const cl = $("cue-list");
+  cl.textContent = "";
+  const cues = state.cue_queue || [];
+  if (!cues.length) {
+    const el = document.createElement("div");
+    el.className = "qrow dim";
+    el.textContent = "no cues";
+    cl.appendChild(el);
+  }
+  cues.forEach((c, i) => {
+    const el = document.createElement("div");
+    el.className = "qrow" + (c.status === "needs_bridge" ? " warn" : "");
+    const mode = c.mode === "after" ? `after ${c.after}` : c.mode;
+    let text = `${i + 1}. ${c.title} - ${mode}`;
+    if (c.status === "needs_bridge") text += " - NEEDS BRIDGE";
+    if (c.warning) text += ` - ${c.warning}`;
+    el.appendChild(document.createTextNode(text + " "));
+    if (c.status === "needs_bridge") {
+      el.appendChild(cueButton("TEMPO", "echo out, own tempo", (b) => override("bridge", "tempo", b)));
+      el.appendChild(cueButton("TRACK", "insert a bridge track", (b) => override("bridge", "track", b)));
+    }
+    if (i > 0) el.appendChild(cueButton("UP", "move up", (b) => override("queue", `move ${i + 1} ${i}`, b)));
+    el.appendChild(cueButton("X", "remove", (b) => override("queue", `remove ${i + 1}`, b)));
+    cl.appendChild(el);
+  });
+  const sl = $("suggest-list");
+  sl.textContent = "";
+  for (const s of state.suggestions || []) {
+    const el = document.createElement("div");
+    el.className = "qrow";
+    if (s.error) { el.textContent = `suggestions unavailable: ${s.error}`; sl.appendChild(el); continue; }
+    const mq = s.mix_quality == null ? "?" : s.mix_quality.toFixed(2);
+    el.title = `score ${s.score} | stretch ${s.stretch_pct}% (${s.tempo_match}) | similarity ${s.similarity} | plan fit ${s.plan_fit}`;
+    el.appendChild(document.createTextNode(
+      `${s.rank}. ${s.title} ${s.bpm} (${s.bpm_gap_pct > 0 ? "+" : ""}${s.bpm_gap_pct}%, ${s.tempo_match}) ` +
+      `${s.camelot} ${s.key_relation} E${s.energy_delta > 0 ? "+" : ""}${s.energy_delta.toFixed(2)} mix ${mq} `));
+    el.appendChild(cueButton("CUE", "play next", (b) => override("cue", `${s.track_id} next`, b)));
+    el.appendChild(cueButton("NOW", "play now", (b) => override("cue", `${s.track_id} now`, b)));
+    sl.appendChild(el);
+  }
 }
 
 async function fetchWave(d) {

@@ -434,6 +434,11 @@ def test_a_malformed_entry_point_is_rejected(session):
 # --- choosing what actually runs ----------------------------------------------
 
 
+def _rule_based(style: str) -> bool:
+    """A preset, or a shape generated for the pair (SPEC §4) -- never the model's."""
+    return style in tr.STYLES or style.startswith("gen_")
+
+
 def _arm(session, style="auto"):
     session.transition_style = style
     assert session.cue_next(origin="test")
@@ -453,7 +458,7 @@ def test_an_invalid_design_falls_back_to_the_preset_and_says_so(session):
     session.intent_engine = FakeModel(dict(GOOD, curve="wobble"))
     _arm(session)
     style, rule = session.last_transition_choice
-    assert style in tr.STYLES, "a rejected design must not run"
+    assert _rule_based(style), "a rejected design must not run"
     assert "rejected" in rule
 
     events = [e for e in log_events(session)
@@ -467,7 +472,7 @@ def test_no_model_means_the_presets_run(session):
     session.intent_engine = None
     _arm(session)
     style, rule = session.last_transition_choice
-    assert style in tr.STYLES
+    assert _rule_based(style)
     assert "no design used" in rule
 
 
@@ -483,7 +488,7 @@ def test_a_model_that_has_gone_away_mid_session_changes_nothing(session):
     session._cued = None
     style = _arm(session) is not None
     assert style, "a transition still had to be armed"
-    assert session.last_transition_choice[0] in tr.STYLES
+    assert _rule_based(session.last_transition_choice[0])
 
 
 def test_a_design_that_is_still_running_is_not_waited_for(session):
@@ -500,7 +505,7 @@ def test_a_design_that_is_still_running_is_not_waited_for(session):
     session.intent_engine = SlowModel(GOOD)
     _arm(session)
     style, rule = session.last_transition_choice
-    assert style in tr.STYLES, "a slow design must not be used"
+    assert _rule_based(style), "a slow design must not be used"
     assert "not ready in time" in rule
     release.set()
 
@@ -558,7 +563,7 @@ def test_the_wait_gives_up_rather_than_arming_late(session, monkeypatch):
     assert not session.design_pending(), "the deadline must end the wait"
 
     session.arm_transition(origin="test")
-    assert session.last_transition_choice[0] in tr.STYLES
+    assert _rule_based(session.last_transition_choice[0])
     never.set()
 
 
@@ -581,9 +586,17 @@ def test_an_explicit_style_request_is_not_second_guessed(session):
 
 
 def test_a_weak_grid_forces_a_cut_over_a_32_bar_design(session):
+    """The operator cues a weak-grid track by hand; safety still overrides.
+
+    Since Phase 0A a grid this weak is quarantined, so autonomous selection
+    will not reach for the track at all -- the only way it gets on a deck is
+    the operator naming it, which quarantine deliberately still allows. That
+    is exactly when this override has to hold.
+    """
     session.intent_engine = FakeModel(dict(GOOD, length_bars=32, curve="s_curve"))
     for track in session.crate:
         object.__setattr__(track, "grid_confidence", 0.02)
+    session._forced_next = session.crate[1]
 
     _arm(session)
     style, rule = session.last_transition_choice
@@ -708,7 +721,7 @@ def test_the_preset_path_logs_the_params_it_used_too(session):
     armed = [e for e in log_events(session) if e["event"] == "transition_armed"]
     used = armed[-1]["params_used"]
     assert used["curve"] in tr.CURVES
-    assert armed[-1]["design_source"] == "preset"
+    assert armed[-1]["design_source"] in ("preset", "generated")
 
 
 # --- the prompt ----------------------------------------------------------------

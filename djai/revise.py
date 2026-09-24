@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from djai import config, preview as preview_mod, transition as tr
+from djai import config, critic as critic_mod, preview as preview_mod, transition as tr
 from djai.analysis import TrackAnalysis
 from djai.deck import LoadedTrack
 
@@ -91,6 +91,10 @@ class PreviewOutcome:
     events: list[str] = field(default_factory=list)
     elapsed_ms: float = 0.0
     budget_ms: float = 0.0
+    #: What the critic measured each round: its distance from the reference
+    #: sets, the measure furthest outside, and what the search predicted.
+    #: Empty when there is no profile to compare with.
+    critic: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -115,6 +119,7 @@ class PreviewOutcome:
             "events": list(self.events),
             "first": _headline(first),
             "final": _headline(last),
+            "critic": list(self.critic),
         }
 
 
@@ -243,6 +248,86 @@ def apply_rules(
     return out, revisions, False
 
 
+#: The profile is read once per process: it is a small file, but a preview is
+#: on a clock and reading it per transition is work for nothing.
+_PROFILE: dict | None = None
+_PROFILE_LOADED = False
+
+
+def reference_profile(path: Any = None) -> dict | None:
+    """The reference distribution the critic scores against, loaded once."""
+    global _PROFILE, _PROFILE_LOADED
+    if path is not None:
+        return critic_mod.load_profile(path)
+    if not _PROFILE_LOADED:
+        _PROFILE = critic_mod.load_profile()
+        _PROFILE_LOADED = True
+    return _PROFILE
+
+
+def critic_revisions(
+    render: Any,
+    loaded_a: Any,
+    loaded_b: Any,
+    params: Any,
+    profile: dict,
+    supervisor: Any = None,
+    weights: dict[str, float] | None = None,
+    measurements: dict[str, Any] | None = None,
+) -> tuple[Any, list[Revision], dict[str, Any]]:
+    """Search for the parameters closest to the reference sets.
+
+    Returns ``(params, revisions, report)``. The revisions are the search's
+    steps in the same shape the rules produced, so everything downstream --
+    the log, the UI, the model's second opinion -- is unchanged.
+
+    This replaces fixed thresholds with a distance. A blend already inside the
+    reference range has nothing to fix and comes back unchanged; one outside it
+    is moved toward the range for as long as the search keeps finding better,
+    instead of the single nudge the rules allowed.
+    """
+    real = critic_mod.measures_from_render(render)
+    if not real:
+        return params, [], {"reason": "not enough steady audio to compare"}
+    # The preview's own dip and overlap are part of the score even though the
+    # search does not steer by them: they decide whether the result is kept.
+    for key in ("loudness_dip_db", "low_end_overlap_bars"):
+        value = (measurements or {}).get(key)
+        if isinstance(value, (int, float)):
+            real[key] = float(value)
+    score, detail = critic_mod.distance(real, profile, weights)
+    surrogate = critic_mod.Surrogate(render, loaded_a, loaded_b, params)
+    if not surrogate.usable:
+        return params, [], {"reason": "surrogate unusable", "score": score,
+                            "measures": real, "detail": detail}
+    offsets = surrogate.calibrate(real)
+    result = critic_mod.search(
+        params, profile, surrogate.predict, weights, supervisor=supervisor
+    )
+    report = {
+        "score": score,
+        "measures": real,
+        "detail": detail,
+        "text": critic_mod.as_text(detail, score),
+        "worst": critic_mod.worst(detail),
+        "predicted_score": result.score,
+        "evaluations": result.evaluations,
+        "refused": result.refused,
+        "offsets": {k: round(v, 2) for k, v in offsets.items()},
+        "steps": result.steps,
+    }
+    if not result.improved:
+        return params, [], report
+    revisions = [
+        Revision(
+            step["field"], step["before"], step["after"], "critic",
+            f"distance from the reference sets {step['was']:.2f} -> {step['score']:.2f}",
+        )
+        for step in result.steps
+    ]
+    return result.params, revisions, report
+
+
 def _later_hot_cue(track_b: TrackAnalysis, entry_point: str) -> str | None:
     """The first hot cue in the incoming track positioned after the current entry.
 
@@ -267,6 +352,31 @@ def _later_hot_cue(track_b: TrackAnalysis, entry_point: str) -> str | None:
     for seconds, index in cues:
         if seconds >= current_s + bar_s and tr.entry_has_runway(track_b, seconds):
             return f"hot_cue_{index}"
+    return None
+
+
+#: Measures a revision may never worsen, whatever it does for the distance:
+#: a hotter peak and a longer vocal clash are not trade-offs, they are faults.
+UNSAFE_IF_WORSE = {
+    "peak_dbfs": 0.5,
+    "vocal_overlap_bars": 0.5,
+}
+
+
+def _unsafe(before: dict[str, Any], after: dict[str, Any]) -> str | None:
+    """Did a revision break something that is not a matter of taste?
+
+    The critic is allowed to trade one measure against another -- that is what
+    a distance is for -- but not to arrive at a louder peak or a longer vocal
+    clash than it started with.
+    """
+    for key, allowance in UNSAFE_IF_WORSE.items():
+        a, b = before.get(key), after.get(key)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if float(b) > float(a) + allowance:
+                return f"{key} {a} -> {b}"
+    if after.get("limiter_engaged") and not before.get("limiter_engaged"):
+        return "the limiter engaged"
     return None
 
 
@@ -297,6 +407,8 @@ def run_preview(
     max_rounds: int | None = None,
     blocksize: int | None = None,
     clock: Callable[[], float] = time.perf_counter,
+    use_critic: bool = True,
+    weights: dict[str, float] | None = None,
 ) -> PreviewOutcome:
     """Render, measure, revise, commit. Never raises, never blocks a transition.
 
@@ -328,12 +440,23 @@ def run_preview(
         outcome.events.append("preview disabled")
         return finish("skipped")
 
+    #: The last render, kept so the critic can measure the same audio rather
+    #: than pay for a second render of the same parameters.
+    rendered: dict[str, Any] = {}
+    profile = reference_profile() if use_critic else None
+    context_bars = (
+        max(config.PREVIEW_CONTEXT_BARS, critic_mod.CONTEXT_BARS)
+        if profile else config.PREVIEW_CONTEXT_BARS
+    )
+
     def take(current) -> dict[str, Any] | None:
         """One render and measurement, or None with the reason recorded."""
         try:
             return preview_mod.preview_transition(
                 state, track_b, current, loaded_b, entry_frame_b,
+                context_bars=context_bars,
                 blocksize=blocksize,
+                on_render=lambda r: rendered.__setitem__("render", r),
             )
         except preview_mod.PreviewError as exc:
             outcome.events.append(f"preview failed at {exc.stage}: {exc.detail}")
@@ -379,9 +502,28 @@ def run_preview(
     current, current_measurements = params, measurements
 
     for round_index in range(1, rounds_allowed + 1):
+        # The rules still own the one verdict that is not a matter of degree:
+        # grids that do not agree cannot be blended at all.
         revised, revisions, force_cut = apply_rules(
             current_measurements, current, track_b
         )
+        critic_report: dict[str, Any] = {}
+        if profile is not None and not force_cut and rendered.get("render") is not None:
+            # A distance, not a threshold: see critic_revisions.
+            revised, revisions, critic_report = critic_revisions(
+                rendered["render"], state.loaded, loaded_b, current, profile,
+                supervisor=supervisor, weights=weights,
+                measurements=current_measurements,
+            )
+            if critic_report.get("text"):
+                outcome.critic.append({
+                    "round": round_index - 1,
+                    "score": critic_report.get("score"),
+                    "worst": critic_report.get("worst"),
+                    "measures": critic_report.get("measures"),
+                    "predicted_score": critic_report.get("predicted_score"),
+                    "evaluations": critic_report.get("evaluations"),
+                })
         if force_cut:
             outcome.force_cut = True
             outcome.events.append(
@@ -424,9 +566,19 @@ def run_preview(
             outcome.params = current
             return finish("committed" if round_index == 1 else "revised")
 
-        # A revision exists. It is safe to commit unverified -- the rules only
-        # ever move a parameter toward its safe end -- so running out of budget
-        # here means committing it, not discarding it.
+        # A revision exists. A rule's revision is safe to commit unverified --
+        # the rules only ever move a parameter toward its safe end -- but the
+        # critic's is not: a search follows a surrogate, and the render that
+        # would have checked it is the one there is no budget for. So an
+        # unverified search result is dropped and the armed parameters stand.
+        if spent_ms() + round_cost_ms > budget and critic_report.get("score") is not None:
+            outcome.params = current
+            outcome.events.append(
+                f"budget {budget:.0f} ms: no time to verify the search "
+                f"({len(revisions)} step(s) predicted "
+                f"{critic_report.get('predicted_score')}); keeping the armed parameters"
+            )
+            return finish("budget")
         if spent_ms() + round_cost_ms > budget:
             outcome.revisions.extend(revisions)
             outcome.params = revised
@@ -452,7 +604,38 @@ def run_preview(
             outcome.params = revised
             return finish("revised")
 
-        regression = is_worse(current_measurements, after)
+        if critic_report.get("score") is not None:
+            # The critic's own verdict decides here. `is_worse` asks whether
+            # two particular measures moved the wrong way at all, which vetoed
+            # every search result in a 20-minute soak -- four transitions
+            # reverted for a 0.3 dB change in a measure the search had traded
+            # away deliberately. What matters is the whole distance, measured
+            # on the real render, plus the guards that are about safety rather
+            # than taste.
+            regression = _unsafe(current_measurements, after)
+        else:
+            regression = is_worse(current_measurements, after)
+        if not regression and critic_report.get("score") is not None:
+            # The search ran on a surrogate. This is the real render of what it
+            # chose, so it is the one that decides: predicted better is not
+            # committed, measured better is.
+            verified = critic_mod.measures_from_render(rendered.get("render"))                 if rendered.get("render") is not None else {}
+            for key in ("loudness_dip_db", "low_end_overlap_bars"):
+                value = after.get(key)
+                if verified and isinstance(value, (int, float)):
+                    verified[key] = float(value)
+            after_score, after_detail = critic_mod.distance(verified, profile, weights)
+            if verified:
+                outcome.critic.append({
+                    "round": round_index, "score": after_score,
+                    "worst": critic_mod.worst(after_detail), "measures": verified,
+                    "verified": True,
+                })
+                if after_score > critic_report["score"] + 1e-6:
+                    regression = (
+                        f"distance from the reference sets {critic_report['score']:.2f}"
+                        f" -> {after_score:.2f}"
+                    )
         outcome.rounds.append({
             "round": round_index, "params": revised.to_schema(),
             "measurements": after,
@@ -461,6 +644,43 @@ def run_preview(
         })
         if regression:
             outcome.events.append(f"revision made it worse ({regression}); reverted")
+            # The search does not steer by the loudness dip -- it cannot
+            # predict it well enough to search on -- so when its answer fails
+            # its own verification and the dip is still over the limit, the old
+            # one-step rule gets the attempt the search just wasted.
+            dip = current_measurements.get("loudness_dip_db")
+            if (
+                critic_report.get("score") is not None
+                and isinstance(dip, (int, float))
+                and float(dip) > config.PREVIEW_MAX_LOUDNESS_DIP_DB
+                and spent_ms() + round_cost_ms <= budget
+            ):
+                ruled, rule_only, _forced = apply_rules(
+                    current_measurements, current, track_b
+                )
+                if rule_only:
+                    fallback = take(ruled)
+                    improved = (
+                        fallback is not None
+                        and not _unsafe(current_measurements, fallback)
+                        and float(fallback.get("loudness_dip_db", 1e9)) < float(dip)
+                    )
+                    outcome.rounds.append({
+                        "round": round_index + 1, "params": ruled.to_schema(),
+                        "measurements": fallback,
+                        "revisions": [r.as_dict() for r in rule_only],
+                        "reverted": not improved,
+                        "rule_fallback": True,
+                    })
+                    if improved:
+                        outcome.revisions.extend(rule_only)
+                        outcome.params = ruled
+                        outcome.events.append(
+                            f"the search was reverted; the dip rule took "
+                            f"{float(dip):.2f} dB to "
+                            f"{float(fallback['loudness_dip_db']):.2f} dB"
+                        )
+                        return finish("revised")
             outcome.params = current
             return finish("reverted")
 
@@ -553,6 +773,7 @@ def _log_preview(session_log: Any, outcome: PreviewOutcome) -> None:
             revisions=[r.as_dict() for r in outcome.revisions],
             rounds=outcome.rounds,
             events=list(outcome.events),
+            critic=list(outcome.critic),
         )
     except Exception:  # noqa: BLE001 - logging must not break a transition
         log.debug("preview logging failed", exc_info=True)

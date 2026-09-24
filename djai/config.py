@@ -32,6 +32,11 @@ __all__ = [
     "MAX_STRETCH_RATIO",
     "STRETCH_DEADBAND",
     "STRETCH_CACHE_SIZE",
+    "FEATURE_BUS_CAPACITY",
+    "MASTER_GLIDE_BARS",
+    "MASTER_TEMPO_LOCKED",
+    "CLOSED_LOOP_ENABLED",
+    "ROOM_MIC_ENABLED",
     "KEY_LOCK_DEFAULT",
     "FILTER_KNOB_RESONANCE",
     "CUE_RING_BLOCKS",
@@ -226,6 +231,36 @@ STRETCH_DEADBAND: float = _env_float("STRETCH_DEADBAND", 0.002)
 #: model and has had the OS kill processes for low memory.
 STRETCH_CACHE_SIZE: int = _env_int("STRETCH_CACHE_SIZE", 2)
 
+#: Rows of callback telemetry the feature bus keeps (SPEC §1). At a 512-frame
+#: block, 512 rows is about six seconds of history -- more than any consumer
+#: looks back, and preallocated once at construction.
+FEATURE_BUS_CAPACITY: int = _env_int("FEATURE_BUS_CAPACITY", 512)
+
+#: Bars the master beat clock takes to glide from the tempo a transition ended
+#: on to the incoming track's own BPM. The glide is scheduled as one pitch step
+#: per bar line, never a per-sample tempo change in the callback.
+#:
+#: Without it the clock is pinned to whatever the night opened at: the incoming
+#: deck is matched to master before the hand-over, so the hand-over adopts
+#: `native * (master/native)` -- master again -- and every later track stays
+#: stretched back to the opener's tempo for the rest of the set.
+MASTER_GLIDE_BARS: int = _env_int("MASTER_GLIDE_BARS", 16)
+
+#: Hold the master clock wherever it is instead of gliding to each incoming
+#: track's tempo. Off by default: it is the fixed-tempo set some operators
+#: want, and it is the behaviour the glide exists to end.
+MASTER_TEMPO_LOCKED: bool = _env_bool("MASTER_TEMPO_LOCKED", False)
+
+#: The closed loop (SPEC §5): measure the master output and correct energy
+#: drops and spikes the playing track does not explain, through the Short
+#: band. See djai.room.
+CLOSED_LOOP_ENABLED: bool = _env_bool("CLOSED_LOOP_ENABLED", True)
+
+#: An optional room microphone, off by default. It only ever adds a second,
+#: noisier reading of the room beside the master proxies; the closed loop never
+#: acts on it. No input device is opened by this program yet.
+ROOM_MIC_ENABLED: bool = _env_bool("ROOM_MIC_ENABLED", False)
+
 #: Key lock: a deck plays at its original pitch whatever its tempo, using the
 #: stretched copy. Per deck, and ON when a deck starts; turning it off on one
 #: deck reverts that deck to resampling. Override the starting state with
@@ -325,9 +360,18 @@ PREVIEW_ENABLED: bool = _env_bool("PREVIEW_ENABLED", True)
 #: 4000 ms buys one measured round on this machine. A render costs roughly
 #: 1.0-1.6 s per pass at the live blocksize (measured: 24 bars of audio, both
 #: decks, 28x realtime at blocksize 2048) and a round is two passes -- the mix,
-#: and deck B alone so the two can be told apart. Raising this to ~8000 buys the
-#: second round that verifies a revision actually helped.
-PREVIEW_BUDGET_MS: float = _env_float("PREVIEW_BUDGET_MS", 4000.0)
+#: and deck B alone so the two can be told apart.
+#:
+#: 8000 ms buys the second round, which is what *verifies* a revision helped:
+#: a critic round measures 3.9-5.0 s, so at 4000 most previews ended in
+#: "budget" and kept the armed parameters, because an unverified search result
+#: is never committed. Measured over a 20-minute soak at 8000: 3 revised, 3
+#: reverted, none out of budget, and the committed round's loudness dip fell
+#: from a median 4.80 dB to 2.86 dB. The preview runs on a worker thread off
+#: the pre-roll hook, so the cost is CPU during the lead, not audio-path time:
+#: two 25-minute soaks at this budget held 0 underruns and 0 dead air with a
+#: worst callback of 24-26 ms.
+PREVIEW_BUDGET_MS: float = _env_float("PREVIEW_BUDGET_MS", 8000.0)
 
 #: What a preview round costs per second of audio in its window, in ms, before
 #: one has been measured: render plus measurement. The loop will not start a
